@@ -17,6 +17,7 @@ const perMinuteLimiter = rateLimit({
   max: 30,
   standardHeaders: true,
   legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
   message: { error: 'Too many requests. Please slow down.' }
 });
 
@@ -26,6 +27,7 @@ const dailyLimiter = rateLimit({
   max: 200,
   standardHeaders: true,
   legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
   message: { error: 'Daily limit reached. Come back tomorrow!' }
 });
 
@@ -35,6 +37,7 @@ const mealPlanDailyLimiter = rateLimit({
   max: 5,
   standardHeaders: true,
   legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
   message: { error: 'Meal plan limit: 5 per day. Come back tomorrow!' }
 });
 
@@ -43,6 +46,7 @@ const recipeDailyLimiter = rateLimit({
   max: 30,
   standardHeaders: true,
   legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
   message: { error: 'Recipe search limit reached for today.' }
 });
 
@@ -51,6 +55,7 @@ const notifDailyLimiter = rateLimit({
   max: 10,
   standardHeaders: true,
   legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
   message: { error: 'Notification generation limit reached for today.' }
 });
 
