@@ -7,6 +7,7 @@ const PORT = process.env.PORT || 3000;
 
 // ---------- Middleware ----------
 
+app.set('trust proxy', 1);
 app.use(express.json({ limit: '25mb' }));
 
 // ── Rate limiters ──────────────────────────────────────────────────────────────
