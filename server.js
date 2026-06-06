@@ -17,6 +17,7 @@ const perMinuteLimiter = rateLimit({
   max: 30,
   standardHeaders: true,
   legacyHeaders: false,
+  skip: (req) => !req.ip,
   message: { error: 'Too many requests. Please slow down.' }
 });
 
@@ -26,6 +27,7 @@ const dailyLimiter = rateLimit({
   max: 200,
   standardHeaders: true,
   legacyHeaders: false,
+  skip: (req) => !req.ip,
   message: { error: 'Daily limit reached. Come back tomorrow!' }
 });
 
@@ -35,6 +37,7 @@ const mealPlanDailyLimiter = rateLimit({
   max: 5,
   standardHeaders: true,
   legacyHeaders: false,
+  skip: (req) => !req.ip,
   message: { error: 'Meal plan limit: 5 per day. Come back tomorrow!' }
 });
 
@@ -43,6 +46,7 @@ const recipeDailyLimiter = rateLimit({
   max: 30,
   standardHeaders: true,
   legacyHeaders: false,
+  skip: (req) => !req.ip,
   message: { error: 'Recipe search limit reached for today.' }
 });
 
@@ -51,6 +55,7 @@ const notifDailyLimiter = rateLimit({
   max: 10,
   standardHeaders: true,
   legacyHeaders: false,
+  skip: (req) => !req.ip,
   message: { error: 'Notification generation limit reached for today.' }
 });
 
@@ -102,7 +107,7 @@ function extractJSON(text) {
 
 function sanitize(str, maxLen = 300) {
   if (typeof str !== 'string') return '';
-  return str.replace(/[<>'"]/g, '').slice(0, maxLen).trim();
+  return str.replace(/[<>'\"]/g, '').slice(0, maxLen).trim();
 }
 
 // ---------- Health ----------
@@ -122,7 +127,7 @@ app.post('/api/ai/scan-food', ...aiLimiter, async (req, res) => {
         {
           text: 'Identify the food in this image and estimate nutritional info for a typical single serving. ' +
                 'Return ONLY compact JSON with no extra text or markdown: ' +
-                '{"name":"str","emoji":"str","calories":0,"protein":0.0,"carbs":0.0,"fat":0.0,"fiber":0.0,"servingSize":"str"}'
+                '{\"name\":\"str\",\"emoji\":\"str\",\"calories\":0,\"protein\":0.0,\"carbs\":0.0,\"fat\":0.0,\"fiber\":0.0,\"servingSize\":\"str\"}'
         }
       ],
       { maxTokens: 300, temperature: 0.2 }
@@ -147,7 +152,7 @@ app.post('/api/ai/analyze-meal', ...aiLimiter, async (req, res) => {
         {
           text: 'Analyze this meal photo in detail. Identify every ingredient visible and estimate the full nutritional breakdown for the entire plate. ' +
                 'Return ONLY compact JSON: ' +
-                '{"name":"str","emoji":"str","calories":0,"protein":0.0,"carbs":0.0,"fat":0.0,"fiber":0.0,"servingSize":"str","ingredients":["ingredient with qty"]}'
+                '{\"name\":\"str\",\"emoji\":\"str\",\"calories\":0,\"protein\":0.0,\"carbs\":0.0,\"fat\":0.0,\"fiber\":0.0,\"servingSize\":\"str\",\"ingredients\":[\"ingredient with qty\"]}'
         }
       ],
       { maxTokens: 500, temperature: 0.2 }
@@ -171,7 +176,7 @@ app.post('/api/ai/analyze-water', ...aiLimiter, async (req, res) => {
       [
         { inlineData: { mimeType, data: image } },
         {
-          text: `Estimate the amount of water or liquid in this image. Return ONLY: {"amount": <number>}\n` +
+          text: `Estimate the amount of water or liquid in this image. Return ONLY: {\"amount\": <number>}\n` +
                 `Unit: ${safeUnit}. A standard glass ≈ 250 mL / 8 fl oz. Return 0 if no liquid visible.`
         }
       ],
@@ -218,7 +223,7 @@ app.post('/api/ai/search-recipes', ...aiLimiter, recipeDailyLimiter, async (req,
   // Kept separate so the recipe generation prompt is never confused by branching logic
   try {
     const checkText = await callGemini(
-      [{ text: `Is "${safeQuery}" a food, dish, ingredient, or cooking topic? Reply with just YES or NO.` }],
+      [{ text: `Is \"${safeQuery}\" a food, dish, ingredient, or cooking topic? Reply with just YES or NO.` }],
       { maxTokens: 5, temperature: 0.1 }
     );
     if (!checkText.trim().toUpperCase().startsWith('YES')) {
@@ -234,7 +239,7 @@ app.post('/api/ai/search-recipes', ...aiLimiter, recipeDailyLimiter, async (req,
 
   // Stage 3 — generate recipes
   let recipePrompt =
-    `Generate exactly 4 delicious recipes for: "${safeQuery}".\n`;
+    `Generate exactly 4 delicious recipes for: \"${safeQuery}\".\n`;
 
   if (Array.isArray(pantryItems) && pantryItems.length > 0) {
     const items = pantryItems.slice(0, 10).map(i => sanitize(String(i?.name ?? i), 50)).join(', ');
@@ -243,7 +248,7 @@ app.post('/api/ai/search-recipes', ...aiLimiter, recipeDailyLimiter, async (req,
 
   recipePrompt +=
     `Return ONLY a JSON array with exactly 4 recipes (no markdown, no extra text):\n` +
-    `[{"name":"str","emoji":"str","prepTime":"20 min","difficulty":"Easy|Medium|Hard","calories":0,"protein":0.0,"carbs":0.0,"fat":0.0,"ingredients":["str"],"steps":["str"]}]\n` +
+    `[{\"name\":\"str\",\"emoji\":\"str\",\"prepTime\":\"20 min\",\"difficulty\":\"Easy|Medium|Hard\",\"calories\":0,\"protein\":0.0,\"carbs\":0.0,\"fat\":0.0,\"ingredients\":[\"str\"],\"steps\":[\"str\"]}]\n` +
     `Include 4-7 ingredients with amounts and 4-6 clear cooking steps. Accurate macros per serving.`;
 
   try {
@@ -267,7 +272,7 @@ app.post('/api/ai/generate-single-recipe', ...aiLimiter, async (req, res) => {
   const prompt =
     `Generate a recipe for: ${safeName}.\n` +
     'Return ONLY compact JSON (no markdown): ' +
-    '{"emoji":"str","calories":0,"protein":0.0,"carbs":0.0,"fat":0.0,"ingredients":["str"],"steps":["str"]}\n' +
+    '{\"emoji\":\"str\",\"calories\":0,\"protein\":0.0,\"carbs\":0.0,\"fat\":0.0,\"ingredients\":[\"str\"],\"steps\":[\"str\"]}\n' +
     'Include 5-8 ingredients with quantities and 4-6 clear cooking steps. Accurate nutrition per serving.';
 
   try {
@@ -309,8 +314,8 @@ app.post('/api/ai/generate-meal-plan', ...aiLimiter, mealPlanDailyLimiter, async
 
   prompt +=
     '\nReturn ONLY compact JSON:\n' +
-    '{"name":"str","description":"str","emoji":"🍽️","color":"AccentGreen","days":[{"dayNumber":1,"meals":[' +
-    '{"mealType":"Breakfast","name":"str","calories":0,"protein":0.0,"carbs":0.0,"fat":0.0,"fiber":0.0,"servingSize":"str","emoji":"str"}]}]}\n' +
+    '{\"name\":\"str\",\"description\":\"str\",\"emoji\":\"🍽️\",\"color\":\"AccentGreen\",\"days\":[{\"dayNumber\":1,\"meals\":[' +
+    '{\"mealType\":\"Breakfast\",\"name\":\"str\",\"calories\":0,\"protein\":0.0,\"carbs\":0.0,\"fat\":0.0,\"fiber\":0.0,\"servingSize\":\"str\",\"emoji\":\"str\"}]}]}\n' +
     'mealType: Breakfast, Lunch, Dinner, or Snack. Include all 4 per day. Realistic macros. Vary across days.';
 
   try {
@@ -360,7 +365,7 @@ app.post('/api/ai/personalize-notifications', ...aiLimiter, notifDailyLimiter, a
     `- Today's scheduled reminders: ${reminderSummary}\n` +
     `- Friends on app: ${Number(friendsCount) || 0}\n\n` +
     `Return ONLY compact JSON:\n` +
-    `{"notifications":[{"id":"str","title":"str","body":"str","hour":9,"minute":0,"category":"expiry|streak|grocery|meal|friend"}]}\n\n` +
+    `{\"notifications\":[{\"id\":\"str\",\"title\":\"str\",\"body\":\"str\",\"hour\":9,\"minute\":0,\"category\":\"expiry|streak|grocery|meal|friend\"}]}\n\n` +
     `RULES (follow strictly):\n` +
     `- Generate exactly 3-4 notifications, never more\n` +
     `- Spread times: morning 8-10h, midday 12-13h, evening 17-19h, night 20-21h\n` +
@@ -402,3 +407,4 @@ app.listen(PORT, () => {
     console.warn('WARNING: GEMINI_API_KEY is not set — AI endpoints will fail.');
   }
 });
+
