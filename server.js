@@ -59,6 +59,15 @@ const notifDailyLimiter = rateLimit({
   message: { error: 'Notification generation limit reached for today.' }
 });
 
+const foodImageDailyLimiter = rateLimit({
+  windowMs: 24 * 60 * 60 * 1000,
+  max: 40,
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
+  message: { error: 'Food image generation limit reached for today.' }
+});
+
 // Stack the two tiers: every AI route uses perMinute + daily
 const aiLimiter = [perMinuteLimiter, dailyLimiter];
 
@@ -245,12 +254,18 @@ app.post('/api/ai/search-recipes', ...aiLimiter, recipeDailyLimiter, async (req,
   }
 
   // Stage 3 — generate recipes
+  // The query is the hard constraint — pantry items are a soft hint only.
+  // Never substitute a different dish just because pantry items are present.
   let recipePrompt =
-    `Generate exactly 4 delicious recipes for: "${safeQuery}".\n`;
+    `Generate exactly 4 recipe variations specifically for: "${safeQuery}".\n` +
+    `CRITICAL RULE: Every single recipe MUST be a version of "${safeQuery}". ` +
+    `Do NOT replace it with a different dish — not even if pantry items suggest it.\n`;
 
   if (Array.isArray(pantryItems) && pantryItems.length > 0) {
     const items = pantryItems.slice(0, 10).map(i => sanitize(String(i?.name ?? i), 50)).join(', ');
-    recipePrompt += `Prioritise using these available pantry ingredients: ${items}.\n`;
+    recipePrompt +=
+      `If any of these pantry items fit naturally into a "${safeQuery}" recipe, include them — ` +
+      `but only if they belong in that dish: ${items}.\n`;
   }
 
   recipePrompt +=
@@ -332,6 +347,43 @@ app.post('/api/ai/generate-meal-plan', ...aiLimiter, mealPlanDailyLimiter, async
     res.json(JSON.parse(extractJSON(text)));
   } catch (err) {
     console.error('[generate-meal-plan]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------- Generate Food Image (Imagen 3) ----------
+
+app.post('/api/ai/food-image', perMinuteLimiter, foodImageDailyLimiter, async (req, res) => {
+  const { name } = req.body;
+  console.log('[food-image] Generating image for:', name);
+  if (!name) return res.status(400).json({ error: 'name is required' });
+
+  const safeName = sanitize(name, 100);
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return res.status(500).json({ error: 'GEMINI_API_KEY not set' });
+
+  try {
+    const imagenUrl = `https://generativelanguage.googleapis.com/v1beta/models/imagen-3.0-fast-generate-001:predict?key=${apiKey}`;
+    const response = await fetch(imagenUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        instances: [{
+          prompt: `Professional food photography of ${safeName}. Appetizing, restaurant-quality plating, natural lighting, close-up shot on a clean white plate or wooden surface. No text, no watermarks.`
+        }],
+        parameters: { sampleCount: 1 }
+      })
+    });
+
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error?.message || `Imagen API ${response.status}`);
+
+    const imageBase64 = data.predictions?.[0]?.bytesBase64Encoded;
+    if (!imageBase64) throw new Error('No image data returned from Imagen');
+
+    res.json({ imageData: imageBase64, mimeType: data.predictions[0].mimeType || 'image/png' });
+  } catch (err) {
+    console.error('[food-image]', err.message);
     res.status(500).json({ error: err.message });
   }
 });
