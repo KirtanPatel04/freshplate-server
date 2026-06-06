@@ -112,12 +112,16 @@ function sanitize(str, maxLen = 300) {
 
 // ---------- Health ----------
 
-app.get('/health', (_req, res) => res.json({ ok: true }));
+app.get('/health', (_req, res) => {
+  console.log('[health] ping');
+  res.json({ ok: true });
+});
 
 // ---------- Scan Food ----------
 
 app.post('/api/ai/scan-food', ...aiLimiter, async (req, res) => {
   const { image, mimeType = 'image/jpeg' } = req.body;
+  console.log('[scan-food] request received');
   if (!image) return res.status(400).json({ error: 'image is required' });
 
   try {
@@ -143,6 +147,7 @@ app.post('/api/ai/scan-food', ...aiLimiter, async (req, res) => {
 
 app.post('/api/ai/analyze-meal', ...aiLimiter, async (req, res) => {
   const { image, mimeType = 'image/jpeg' } = req.body;
+  console.log('[analyze-meal] request received');
   if (!image) return res.status(400).json({ error: 'image is required' });
 
   try {
@@ -168,6 +173,7 @@ app.post('/api/ai/analyze-meal', ...aiLimiter, async (req, res) => {
 
 app.post('/api/ai/analyze-water', ...aiLimiter, async (req, res) => {
   const { image, mimeType = 'image/jpeg', unit = 'mL' } = req.body;
+  console.log('[analyze-water] request received');
   if (!image) return res.status(400).json({ error: 'image is required' });
 
   const safeUnit = sanitize(unit, 20);
@@ -207,6 +213,7 @@ function isObviouslyNotFood(query) {
 
 app.post('/api/ai/search-recipes', ...aiLimiter, recipeDailyLimiter, async (req, res) => {
   const { query, pantryItems = [] } = req.body;
+  console.log('[search-recipes] query:', query);
   if (!query) return res.status(400).json({ error: 'query is required' });
 
   const safeQuery = sanitize(query, 200);
@@ -266,6 +273,7 @@ app.post('/api/ai/search-recipes', ...aiLimiter, recipeDailyLimiter, async (req,
 
 app.post('/api/ai/generate-single-recipe', ...aiLimiter, async (req, res) => {
   const { name } = req.body;
+  console.log('[generate-single-recipe] name:', name);
   if (!name) return res.status(400).json({ error: 'name is required' });
 
   const safeName = sanitize(name, 100);
@@ -287,6 +295,7 @@ app.post('/api/ai/generate-single-recipe', ...aiLimiter, async (req, res) => {
 // ---------- Generate Meal Plan ----------
 
 app.post('/api/ai/generate-meal-plan', ...aiLimiter, mealPlanDailyLimiter, async (req, res) => {
+  console.log('[generate-meal-plan] request received');
   const {
     days = 7, targetCalories = 2000,
     proteinGoal = 150, carbGoal = 200, fatGoal = 65,
@@ -330,6 +339,7 @@ app.post('/api/ai/generate-meal-plan', ...aiLimiter, mealPlanDailyLimiter, async
 // ---------- Personalized Notifications ----------
 
 app.post('/api/ai/personalize-notifications', ...aiLimiter, notifDailyLimiter, async (req, res) => {
+  console.log('[personalize-notifications] request received');
   const {
     name           = 'there',
     dayOfWeek      = 'today',
