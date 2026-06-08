@@ -59,14 +59,6 @@ const notifDailyLimiter = rateLimit({
   message: { error: 'Notification generation limit reached for today.' }
 });
 
-const foodImageDailyLimiter = rateLimit({
-  windowMs: 24 * 60 * 60 * 1000,
-  max: 40,
-  standardHeaders: true,
-  legacyHeaders: false,
-  validate: { xForwardedForHeader: false },
-  message: { error: 'Food image generation limit reached for today.' }
-});
 
 // Stack the two tiers: every AI route uses perMinute + daily
 const aiLimiter = [perMinuteLimiter, dailyLimiter];
@@ -347,44 +339,6 @@ app.post('/api/ai/generate-meal-plan', ...aiLimiter, mealPlanDailyLimiter, async
     res.json(JSON.parse(extractJSON(text)));
   } catch (err) {
     console.error('[generate-meal-plan]', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ---------- Generate Food Image (gemini-2.5-flash-image) ----------
-
-app.post('/api/ai/food-image', perMinuteLimiter, foodImageDailyLimiter, async (req, res) => {
-  const { name } = req.body;
-  console.log('[food-image] Generating image for:', name);
-  if (!name) return res.status(400).json({ error: 'name is required' });
-
-  const safeName = sanitize(name, 100);
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) return res.status(500).json({ error: 'GEMINI_API_KEY not set' });
-
-  try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=${apiKey}`;
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{
-          parts: [{ text: `Professional food photography of ${safeName}. Appetizing, restaurant-quality plating, natural lighting, close-up shot on a clean white plate or wooden surface. No text, no watermarks.` }]
-        }],
-        generationConfig: { responseModalities: ['TEXT', 'IMAGE'] }
-      })
-    });
-
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error?.message || `Gemini image API ${response.status}`);
-
-    const parts = data.candidates?.[0]?.content?.parts ?? [];
-    const inline = parts.find(p => p.inlineData);
-    if (!inline) throw new Error('No image data in response');
-
-    res.json({ imageData: inline.inlineData.data, mimeType: inline.inlineData.mimeType || 'image/png' });
-  } catch (err) {
-    console.error('[food-image]', err.message);
     res.status(500).json({ error: err.message });
   }
 });
