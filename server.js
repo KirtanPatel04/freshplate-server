@@ -351,7 +351,7 @@ app.post('/api/ai/generate-meal-plan', ...aiLimiter, mealPlanDailyLimiter, async
   }
 });
 
-// ---------- Generate Food Image (Imagen 3) ----------
+// ---------- Generate Food Image (Gemini 2.5 Flash) ----------
 
 app.post('/api/ai/food-image', perMinuteLimiter, foodImageDailyLimiter, async (req, res) => {
   const { name } = req.body;
@@ -363,25 +363,26 @@ app.post('/api/ai/food-image', perMinuteLimiter, foodImageDailyLimiter, async (r
   if (!apiKey) return res.status(500).json({ error: 'GEMINI_API_KEY not set' });
 
   try {
-    const imagenUrl = `https://generativelanguage.googleapis.com/v1beta/models/imagen-3.0-fast-generate-001:predict?key=${apiKey}`;
-    const response = await fetch(imagenUrl, {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
+    const response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        instances: [{
-          prompt: `Professional food photography of ${safeName}. Appetizing, restaurant-quality plating, natural lighting, close-up shot on a clean white plate or wooden surface. No text, no watermarks.`
+        contents: [{
+          parts: [{ text: `Professional food photography of ${safeName}. Appetizing, restaurant-quality plating, natural lighting, close-up shot on a clean white plate or wooden surface. No text, no watermarks.` }]
         }],
-        parameters: { sampleCount: 1 }
+        generationConfig: { responseModalities: ['IMAGE'] }
       })
     });
 
     const data = await response.json();
-    if (!response.ok) throw new Error(data.error?.message || `Imagen API ${response.status}`);
+    if (!response.ok) throw new Error(data.error?.message || `Gemini API ${response.status}`);
 
-    const imageBase64 = data.predictions?.[0]?.bytesBase64Encoded;
-    if (!imageBase64) throw new Error('No image data returned from Imagen');
+    const parts = data.candidates?.[0]?.content?.parts ?? [];
+    const inline = parts.find(p => p.inlineData);
+    if (!inline) throw new Error('No image data returned from Gemini');
 
-    res.json({ imageData: imageBase64, mimeType: data.predictions[0].mimeType || 'image/png' });
+    res.json({ imageData: inline.inlineData.data, mimeType: inline.inlineData.mimeType || 'image/png' });
   } catch (err) {
     console.error('[food-image]', err.message);
     res.status(500).json({ error: err.message });
