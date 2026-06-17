@@ -246,22 +246,28 @@ app.post('/api/ai/search-recipes', ...aiLimiter, recipeDailyLimiter, async (req,
   }
 
   // Stage 3 — generate recipes
-  // The query is the hard constraint — pantry items are a soft hint only.
-  // Never substitute a different dish just because pantry items are present.
+  // Index 0 MUST be the exact dish the user typed. Indexes 1-3 are similar but distinct dishes.
   let recipePrompt =
-    `Generate exactly 4 recipe variations specifically for: "${safeQuery}".\n` +
-    `CRITICAL RULE: Every single recipe MUST be a version of "${safeQuery}". ` +
-    `Do NOT replace it with a different dish — not even if pantry items suggest it.\n`;
+    `The user searched for: "${safeQuery}". Return exactly 4 recipes as a JSON array.\n\n` +
+    `ARRAY INDEX 0 — THE EXACT RECIPE THE USER SEARCHED FOR:\n` +
+    `  • "name" MUST be "${safeQuery}" with proper capitalisation of each word\n` +
+    `  • Give the classic, definitive version of this exact dish\n` +
+    `  • DO NOT rename it, reinterpret it, or replace it with a similar dish\n` +
+    `  • If the user typed "Butter Chicken", index 0 name is "Butter Chicken" — not "Chicken Curry"\n` +
+    `  • If the user typed "pasta", index 0 name is "Pasta" — not "Spaghetti Bolognese"\n\n` +
+    `ARRAY INDEXES 1, 2, 3 — SIMILAR RECIPES (genuinely different dishes):\n` +
+    `  • Share the same cuisine, main ingredient, or cooking method as "${safeQuery}"\n` +
+    `  • Must each be a clearly different recipe from index 0 and from each other\n` +
+    `  • Example: "${safeQuery}" = "Chicken Stir Fry" → indexes 1-3: "Beef and Broccoli", "Shrimp Fried Rice", "Pad Thai"\n\n`;
 
   if (Array.isArray(pantryItems) && pantryItems.length > 0) {
     const items = pantryItems.slice(0, 10).map(i => sanitize(String(i?.name ?? i), 50)).join(', ');
     recipePrompt +=
-      `If any of these pantry items fit naturally into a "${safeQuery}" recipe, include them — ` +
-      `but only if they belong in that dish: ${items}.\n`;
+      `Where it fits naturally, use these pantry items: ${items}.\n\n`;
   }
 
   recipePrompt +=
-    `Return ONLY a JSON array with exactly 4 recipes (no markdown, no extra text):\n` +
+    `Return ONLY a JSON array (no markdown, no extra text):\n` +
     `[{"name":"str","emoji":"str","prepTime":"20 min","difficulty":"Easy|Medium|Hard","calories":0,"protein":0.0,"carbs":0.0,"fat":0.0,"ingredients":["str"],"steps":["str"]}]\n` +
     `Include 4-7 ingredients with amounts and 4-6 clear cooking steps. Accurate macros per serving.`;
 
@@ -269,6 +275,24 @@ app.post('/api/ai/search-recipes', ...aiLimiter, recipeDailyLimiter, async (req,
     const text   = await callGemini([{ text: recipePrompt }], { maxTokens: 3000 });
     const parsed = JSON.parse(extractJSON(text));
     if (!Array.isArray(parsed)) throw new Error('Unexpected response format from AI.');
+
+    // Guarantee the exact-match recipe is first — reorder if the AI drifted
+    const norm = s => s.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
+    const queryNorm = norm(safeQuery);
+    const exactIdx = parsed.findIndex(r => {
+      const n = norm(r.name || '');
+      return n === queryNorm || n.includes(queryNorm) || queryNorm.includes(n);
+    });
+    if (exactIdx > 0) {
+      const [match] = parsed.splice(exactIdx, 1);
+      parsed.unshift(match);
+    }
+    // Force the first recipe's name to exactly match the query (proper title case)
+    if (parsed.length > 0) {
+      const titleCase = safeQuery.replace(/\b\w/g, c => c.toUpperCase());
+      parsed[0].name = titleCase;
+    }
+
     res.json(parsed);
   } catch (err) {
     console.error('[search-recipes]', err.message);
@@ -407,6 +431,92 @@ app.post('/api/ai/personalize-notifications', ...aiLimiter, notifDailyLimiter, a
     res.json({ notifications: notifs });
   } catch (err) {
     console.error('[personalize-notifications]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------- Scan Pantry Item (food photo → name + expiry estimate) ----------
+
+app.post('/api/ai/scan-pantry-item', ...aiLimiter, async (req, res) => {
+  const { image, mimeType = 'image/jpeg' } = req.body;
+  console.log('[scan-pantry-item] request received');
+  if (!image) return res.status(400).json({ error: 'image is required' });
+
+  try {
+    const text = await callGemini(
+      [
+        { inlineData: { mimeType, data: image } },
+        {
+          text: 'Identify the food item in this image. Estimate how many days it stays fresh (expiryDays). ' +
+                'Examples: fresh chicken=3, berries=3, milk=7, bread=5, apple=14, hard cheese=30, canned goods=365. ' +
+                'Return ONLY compact JSON with no extra text or markdown: ' +
+                '{"name":"str","emoji":"str","quantity":1,"unit":"pcs","category":"produce|proteins|dairy|grains|condiments|snacks|beverages|frozen|other","expiryDays":7}'
+        }
+      ],
+      { maxTokens: 200, temperature: 0.2 }
+    );
+    res.json(JSON.parse(extractJSON(text)));
+  } catch (err) {
+    console.error('[scan-pantry-item]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------- Scan Receipt ----------
+
+app.post('/api/ai/scan-receipt', ...aiLimiter, async (req, res) => {
+  const { image, mimeType = 'image/jpeg' } = req.body;
+  console.log('[scan-receipt] request received');
+  if (!image) return res.status(400).json({ error: 'image is required' });
+
+  try {
+    const text = await callGemini(
+      [
+        { inlineData: { mimeType, data: image } },
+        {
+          text: 'This is a grocery receipt. Extract every food and grocery item purchased. ' +
+                'For each item return name, emoji, quantity, unit, and category. ' +
+                'Return ONLY a JSON array with no extra text or markdown: ' +
+                '[{"name":"str","emoji":"str","quantity":1,"unit":"pcs","category":"produce|proteins|dairy|grains|condiments|snacks|beverages|frozen|other"}] ' +
+                'Skip store names, taxes, totals, dates, and non-food items. If no items found return [].'
+        }
+      ],
+      { maxTokens: 1000, temperature: 0.2 }
+    );
+    const parsed = JSON.parse(extractJSON(text));
+    res.json({ items: Array.isArray(parsed) ? parsed : [] });
+  } catch (err) {
+    console.error('[scan-receipt]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------- Scan Groceries (photo of multiple items) ----------
+
+app.post('/api/ai/scan-groceries', ...aiLimiter, async (req, res) => {
+  const { image, mimeType = 'image/jpeg' } = req.body;
+  console.log('[scan-groceries] request received');
+  if (!image) return res.status(400).json({ error: 'image is required' });
+
+  try {
+    const text = await callGemini(
+      [
+        { inlineData: { mimeType, data: image } },
+        {
+          text: 'Look at this photo of groceries. Identify every distinct food item visible. ' +
+                'For each item estimate the quantity based on what you can see (count individual pieces, estimate weight/volume for bulk). ' +
+                'Return ONLY a JSON array with no extra text or markdown: ' +
+                '[{"name":"str","emoji":"str","quantity":1.0,"unit":"pcs","category":"produce|proteins|dairy|grains|condiments|snacks|beverages|frozen|other"}] ' +
+                'Use sensible units: pcs for countable items, g/kg for loose items, L/mL for liquids, bags/boxes for packaged items. ' +
+                'If no food items are visible return [].'
+        }
+      ],
+      { maxTokens: 800, temperature: 0.2 }
+    );
+    const parsed = JSON.parse(extractJSON(text));
+    res.json({ items: Array.isArray(parsed) ? parsed : [] });
+  } catch (err) {
+    console.error('[scan-groceries]', err.message);
     res.status(500).json({ error: err.message });
   }
 });
