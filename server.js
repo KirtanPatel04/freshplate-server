@@ -272,12 +272,18 @@ app.post('/api/ai/search-recipes', ...aiLimiter, recipeDailyLimiter, async (req,
   try {
     let parsed;
     for (let attempt = 1; attempt <= 2; attempt++) {
-      const text = await callGemini([{ text: recipePrompt }], { maxTokens: 3000 });
       try {
-        const candidate = JSON.parse(extractJSON(text));
+        const text = await callGemini([{ text: recipePrompt }], { maxTokens: 3000 });
+        let candidate = JSON.parse(extractJSON(text));
+        // Unwrap {"recipes":[...]} or similar wrappers Gemini sometimes returns
+        if (!Array.isArray(candidate)) {
+          const inner = Object.values(candidate).find(v => Array.isArray(v));
+          if (inner) candidate = inner;
+        }
         if (Array.isArray(candidate) && candidate.length > 0) { parsed = candidate; break; }
-      } catch (_) {
-        if (attempt === 2) throw new Error('Could not parse recipe response. Please try again.');
+        throw new Error('Response was not a valid recipe array.');
+      } catch (err) {
+        if (attempt === 2) throw err;
       }
     }
     if (!parsed) throw new Error('Could not parse recipe response. Please try again.');
