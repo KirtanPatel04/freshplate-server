@@ -227,25 +227,24 @@ app.post('/api/ai/search-recipes', ...aiLimiter, recipeDailyLimiter, async (req,
     });
   }
 
-  // Stage 2 — simple YES/NO food check (cheap: ~5 tokens out)
-  // Kept separate so the recipe generation prompt is never confused by branching logic
+  // Stage 2 — simple YES/NO food check
+  // Use a lenient match so Gemini responses like "Yes, that is a food..." still pass
   try {
     const checkText = await callGemini(
       [{ text: `Is "${safeQuery}" a food, dish, ingredient, or cooking topic? Reply with just YES or NO.` }],
-      { maxTokens: 5, temperature: 0.1 }
+      { maxTokens: 10, temperature: 0.1 }
     );
-    if (!checkText.trim().toUpperCase().startsWith('YES')) {
+    if (!/yes/i.test(checkText)) {
       return res.status(400).json({
-        error: 'not_food',
-        message: 'Please search for a food or recipe topic — FreshPlate is your kitchen companion! 🍽️'
+        error: 'Please search for a food or recipe — FreshPlate is your kitchen companion! 🍽️'
       });
     }
   } catch (err) {
     console.error('[search-recipes/check]', err.message);
-    // If the safety check itself errors, let the query through — generation prompt is harmless
+    // Safety check error → let the query through; generation prompt is harmless
   }
 
-  // Stage 3 — generate recipes
+  // Stage 3 — generate recipes (with one automatic retry on JSON parse failure)
   // Index 0 MUST be the exact dish the user typed. Indexes 1-3 are similar but distinct dishes.
   let recipePrompt =
     `The user searched for: "${safeQuery}". Return exactly 4 recipes as a JSON array.\n\n` +
@@ -262,19 +261,26 @@ app.post('/api/ai/search-recipes', ...aiLimiter, recipeDailyLimiter, async (req,
 
   if (Array.isArray(pantryItems) && pantryItems.length > 0) {
     const items = pantryItems.slice(0, 10).map(i => sanitize(String(i?.name ?? i), 50)).join(', ');
-    recipePrompt +=
-      `Where it fits naturally, use these pantry items: ${items}.\n\n`;
+    recipePrompt += `Where it fits naturally, use these pantry items: ${items}.\n\n`;
   }
 
   recipePrompt +=
-    `Return ONLY a JSON array (no markdown, no extra text):\n` +
+    `Return ONLY a raw JSON array with no markdown, no code fences, no extra text:\n` +
     `[{"name":"str","emoji":"str","prepTime":"20 min","difficulty":"Easy|Medium|Hard","calories":0,"protein":0.0,"carbs":0.0,"fat":0.0,"ingredients":["str"],"steps":["str"]}]\n` +
     `Include 4-7 ingredients with amounts and 4-6 clear cooking steps. Accurate macros per serving.`;
 
   try {
-    const text   = await callGemini([{ text: recipePrompt }], { maxTokens: 3000 });
-    const parsed = JSON.parse(extractJSON(text));
-    if (!Array.isArray(parsed)) throw new Error('Unexpected response format from AI.');
+    let parsed;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const text = await callGemini([{ text: recipePrompt }], { maxTokens: 3000 });
+      try {
+        const candidate = JSON.parse(extractJSON(text));
+        if (Array.isArray(candidate) && candidate.length > 0) { parsed = candidate; break; }
+      } catch (_) {
+        if (attempt === 2) throw new Error('Could not parse recipe response. Please try again.');
+      }
+    }
+    if (!parsed) throw new Error('Could not parse recipe response. Please try again.');
 
     // Guarantee the exact-match recipe is first — reorder if the AI drifted
     const norm = s => s.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
@@ -296,7 +302,7 @@ app.post('/api/ai/search-recipes', ...aiLimiter, recipeDailyLimiter, async (req,
     res.json(parsed);
   } catch (err) {
     console.error('[search-recipes]', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Could not load recipes. Please try again.' });
   }
 });
 
