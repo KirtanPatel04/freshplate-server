@@ -72,22 +72,30 @@ async function callGemini(parts, { maxTokens = 8000, temperature = 0.7 } = {}) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error('GEMINI_API_KEY is not set on the server.');
 
-  const res = await fetch(`${GEMINI_URL}?key=${apiKey}`, {
-    method:  'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [{ role: 'user', parts }],
-      generationConfig: { maxOutputTokens: maxTokens, temperature }
-    })
+  const body = JSON.stringify({
+    contents: [{ role: 'user', parts }],
+    generationConfig: { maxOutputTokens: maxTokens, temperature }
   });
 
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Gemini API ${res.status}: ${body}`);
-  }
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const res = await fetch(`${GEMINI_URL}?key=${apiKey}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body
+    });
 
-  const data = await res.json();
-  return data.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
+    // Retry on transient overload / rate-limit errors
+    if ((res.status === 503 || res.status === 429) && attempt < 3) {
+      await new Promise(r => setTimeout(r, attempt * 1500));
+      continue;
+    }
+
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Gemini API ${res.status}: ${text}`);
+    }
+
+    const data = await res.json();
+    return data.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
+  }
 }
 
 // Extract first JSON object or array from text (tolerates model preamble)
