@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import rateLimit from 'express-rate-limit';
+import { readFileSync, writeFileSync } from 'fs';
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -63,12 +64,13 @@ const notifDailyLimiter = rateLimit({
 // Stack the two tiers: every AI route uses perMinute + daily
 const aiLimiter = [perMinuteLimiter, dailyLimiter];
 
-// ---------- Gemini helper ----------
+// ---------- Gemini helpers ----------
 
-const GEMINI_URL =
-  'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent';
+const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
+const MODEL_MAIN  = 'gemini-2.0-flash';       // reliable — recipes, meal plans, scanning
+const MODEL_CHECK = 'gemini-2.5-flash-lite';  // cheapest — yes/no safety check only
 
-async function callGemini(parts, { maxTokens = 8000, temperature = 0.7 } = {}) {
+async function callGemini(parts, { maxTokens = 8000, temperature = 0.7, model = MODEL_MAIN } = {}) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error('GEMINI_API_KEY is not set on the server.');
 
@@ -78,11 +80,10 @@ async function callGemini(parts, { maxTokens = 8000, temperature = 0.7 } = {}) {
   });
 
   for (let attempt = 1; attempt <= 3; attempt++) {
-    const res = await fetch(`${GEMINI_URL}?key=${apiKey}`, {
+    const res = await fetch(`${GEMINI_BASE}/${model}:generateContent?key=${apiKey}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body
     });
 
-    // Retry on transient overload / rate-limit errors
     if ((res.status === 503 || res.status === 429) && attempt < 3) {
       await new Promise(r => setTimeout(r, attempt * 1500));
       continue;
@@ -239,7 +240,7 @@ app.post('/api/ai/search-recipes', ...aiLimiter, recipeDailyLimiter, async (req,
   try {
     const checkText = await callGemini(
       [{ text: `Is "${safeQuery}" a food, dish, ingredient, or cooking topic? Reply with just YES or NO.` }],
-      { maxTokens: 5, temperature: 0.1 }
+      { maxTokens: 5, temperature: 0.1, model: MODEL_CHECK }
     );
     if (!checkText.trim().toUpperCase().startsWith('YES')) {
       return res.status(400).json({
@@ -538,8 +539,20 @@ app.post('/api/ai/scan-groceries', ...aiLimiter, async (req, res) => {
 
 // ---------- Generate Food Image (Replicate Flux Schnell) ----------
 
-// In-memory cache: lowercased meal name → base64 webp string
-const foodImageCache = new Map();
+// Persistent image cache — survives server restarts
+const IMAGE_CACHE_FILE = '/tmp/food_image_cache.json';
+let foodImageCache = new Map();
+try {
+  const saved = JSON.parse(readFileSync(IMAGE_CACHE_FILE, 'utf8'));
+  foodImageCache = new Map(Object.entries(saved));
+  console.log(`[image-cache] loaded ${foodImageCache.size} cached images`);
+} catch { /* first run — file doesn't exist yet */ }
+
+function persistImageCache() {
+  try {
+    writeFileSync(IMAGE_CACHE_FILE, JSON.stringify(Object.fromEntries(foodImageCache)));
+  } catch (e) { console.error('[image-cache] persist error:', e.message); }
+}
 
 async function generateFoodImageB64(name) {
   const apiKey = process.env.REPLICATE_API_KEY;
@@ -581,6 +594,7 @@ async function generateFoodImageB64(name) {
   if (!imgRes.ok) throw new Error('Failed to download image from Replicate');
   const b64 = Buffer.from(await imgRes.arrayBuffer()).toString('base64');
   foodImageCache.set(cacheKey, b64);
+  persistImageCache();
   return b64;
 }
 
