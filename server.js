@@ -67,7 +67,7 @@ const aiLimiter = [perMinuteLimiter, dailyLimiter];
 // ---------- Gemini helpers ----------
 
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
-const MODEL_MAIN  = 'gemini-2.5-flash';        // reliable — recipes, meal plans, scanning
+const MODEL_MAIN  = 'gemini-2.5-flash-lite';   // fast + cheap — retry handles 503 spikes
 const MODEL_CHECK = 'gemini-2.5-flash-lite';  // cheapest — yes/no safety check only
 
 async function callGemini(parts, { maxTokens = 8000, temperature = 0.7, model = MODEL_MAIN } = {}) {
@@ -299,14 +299,6 @@ app.post('/api/ai/search-recipes', ...aiLimiter, recipeDailyLimiter, async (req,
     if (parsed.length > 0) {
       const titleCase = safeQuery.replace(/\b\w/g, c => c.toUpperCase());
       parsed[0].name = titleCase;
-    }
-
-    // Generate all images in parallel and embed in response so iOS shows them instantly
-    if (process.env.REPLICATE_API_KEY) {
-      const imageResults = await Promise.allSettled(parsed.map(r => generateFoodImageB64(r.name)));
-      imageResults.forEach((result, i) => {
-        if (result.status === 'fulfilled') parsed[i].imageData = result.value;
-      });
     }
 
     res.json(parsed);
