@@ -271,7 +271,7 @@ app.post('/api/ai/search-recipes', ...aiLimiter, recipeDailyLimiter, async (req,
     `Include 4-7 ingredients with amounts and 4-6 clear cooking steps. Accurate macros per serving.`;
 
   try {
-    const text   = await callGemini([{ text: recipePrompt }], { maxTokens: 6000 });
+    const text   = await callGemini([{ text: recipePrompt }], { maxTokens: 16000 });
     const parsed = JSON.parse(extractJSON(text));
     if (!Array.isArray(parsed)) throw new Error('Unexpected response format from AI.');
 
