@@ -68,7 +68,7 @@ const aiLimiter = [perMinuteLimiter, dailyLimiter];
 const GEMINI_URL =
   'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent';
 
-async function callGemini(parts, { maxTokens = 8000, temperature = 0.7 } = {}) {
+async function callGemini(parts, { maxTokens = 8000, temperature = 0.7, thinking = false } = {}) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error('GEMINI_API_KEY is not set on the server.');
 
@@ -77,7 +77,13 @@ async function callGemini(parts, { maxTokens = 8000, temperature = 0.7 } = {}) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       contents: [{ role: 'user', parts }],
-      generationConfig: { maxOutputTokens: maxTokens, temperature }
+      generationConfig: {
+        maxOutputTokens: maxTokens,
+        temperature,
+        // Disable thinking for structured-JSON calls — saves tokens and avoids
+        // parts[0] being the reasoning monologue instead of the JSON response
+        ...(!thinking && { thinkingConfig: { thinkingBudget: 0 } })
+      }
     })
   });
 
@@ -87,7 +93,10 @@ async function callGemini(parts, { maxTokens = 8000, temperature = 0.7 } = {}) {
   }
 
   const data = await res.json();
-  return data.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
+  // Gemini 2.5 thinking models return thought:true parts before the real response
+  const responseParts = data.candidates?.[0]?.content?.parts ?? [];
+  const textParts = responseParts.filter(p => !p.thought);
+  return (textParts.length ? textParts : responseParts).map(p => p.text ?? '').join('');
 }
 
 // Extract first JSON object or array from text (tolerates model preamble)
@@ -273,7 +282,7 @@ app.post('/api/ai/search-recipes', ...aiLimiter, recipeDailyLimiter, async (req,
     let parsed;
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
-        const text = await callGemini([{ text: recipePrompt }], { maxTokens: 3000 });
+        const text = await callGemini([{ text: recipePrompt }], { maxTokens: 6000 });
         let candidate = JSON.parse(extractJSON(text));
         // Unwrap {"recipes":[...]} or similar wrappers Gemini sometimes returns
         if (!Array.isArray(candidate)) {
