@@ -68,7 +68,7 @@ const aiLimiter = [perMinuteLimiter, dailyLimiter];
 const GEMINI_URL =
   'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent';
 
-async function callGemini(parts, { maxTokens = 8000, temperature = 0.7, thinking = false } = {}) {
+async function callGemini(parts, { maxTokens = 8000, temperature = 0.7 } = {}) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error('GEMINI_API_KEY is not set on the server.');
 
@@ -77,13 +77,7 @@ async function callGemini(parts, { maxTokens = 8000, temperature = 0.7, thinking
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       contents: [{ role: 'user', parts }],
-      generationConfig: {
-        maxOutputTokens: maxTokens,
-        temperature,
-        // Disable thinking for structured-JSON calls — saves tokens and avoids
-        // parts[0] being the reasoning monologue instead of the JSON response
-        ...(!thinking && { thinkingConfig: { thinkingBudget: 0 } })
-      }
+      generationConfig: { maxOutputTokens: maxTokens, temperature }
     })
   });
 
@@ -93,10 +87,7 @@ async function callGemini(parts, { maxTokens = 8000, temperature = 0.7, thinking
   }
 
   const data = await res.json();
-  // Gemini 2.5 thinking models return thought:true parts before the real response
-  const responseParts = data.candidates?.[0]?.content?.parts ?? [];
-  const textParts = responseParts.filter(p => !p.thought);
-  return (textParts.length ? textParts : responseParts).map(p => p.text ?? '').join('');
+  return data.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
 }
 
 // Extract first JSON object or array from text (tolerates model preamble)
@@ -228,6 +219,7 @@ app.post('/api/ai/search-recipes', ...aiLimiter, recipeDailyLimiter, async (req,
 
   const safeQuery = sanitize(query, 200);
 
+  // Stage 1 — fast local blocklist (zero API cost)
   if (isObviouslyNotFood(safeQuery)) {
     return res.status(400).json({
       error: 'not_food',
@@ -235,41 +227,75 @@ app.post('/api/ai/search-recipes', ...aiLimiter, recipeDailyLimiter, async (req,
     });
   }
 
-  let prompt =
-    `The user searched for: "${safeQuery}". Return exactly 4 recipes as a JSON array.\n` +
-    `Index 0 MUST be the exact dish "${safeQuery}" (classic version, do not rename it).\n` +
-    `Indexes 1-3 are similar but clearly different dishes sharing the same cuisine or main ingredient.\n`;
+  // Stage 2 — simple YES/NO food check (cheap: ~5 tokens out)
+  try {
+    const checkText = await callGemini(
+      [{ text: `Is "${safeQuery}" a food, dish, ingredient, or cooking topic? Reply with just YES or NO.` }],
+      { maxTokens: 5, temperature: 0.1 }
+    );
+    if (!checkText.trim().toUpperCase().startsWith('YES')) {
+      return res.status(400).json({
+        error: 'not_food',
+        message: 'Please search for a food or recipe topic — FreshPlate is your kitchen companion! 🍽️'
+      });
+    }
+  } catch (err) {
+    console.error('[search-recipes/check]', err.message);
+    // If the safety check itself errors, let the query through — generation prompt is harmless
+  }
+
+  // Stage 3 — generate recipes
+  // Index 0 MUST be the exact dish the user typed. Indexes 1-3 are similar but distinct dishes.
+  let recipePrompt =
+    `The user searched for: "${safeQuery}". Return exactly 4 recipes as a JSON array.\n\n` +
+    `ARRAY INDEX 0 — THE EXACT RECIPE THE USER SEARCHED FOR:\n` +
+    `  • "name" MUST be "${safeQuery}" with proper capitalisation of each word\n` +
+    `  • Give the classic, definitive version of this exact dish\n` +
+    `  • DO NOT rename it, reinterpret it, or replace it with a similar dish\n` +
+    `  • If the user typed "Butter Chicken", index 0 name is "Butter Chicken" — not "Chicken Curry"\n` +
+    `  • If the user typed "pasta", index 0 name is "Pasta" — not "Spaghetti Bolognese"\n\n` +
+    `ARRAY INDEXES 1, 2, 3 — SIMILAR RECIPES (genuinely different dishes):\n` +
+    `  • Share the same cuisine, main ingredient, or cooking method as "${safeQuery}"\n` +
+    `  • Must each be a clearly different recipe from index 0 and from each other\n` +
+    `  • Example: "${safeQuery}" = "Chicken Stir Fry" → indexes 1-3: "Beef and Broccoli", "Shrimp Fried Rice", "Pad Thai"\n\n`;
 
   if (Array.isArray(pantryItems) && pantryItems.length > 0) {
     const items = pantryItems.slice(0, 10).map(i => sanitize(String(i?.name ?? i), 50)).join(', ');
-    prompt += `Where natural, use these pantry items: ${items}.\n`;
+    recipePrompt +=
+      `Where it fits naturally, use these pantry items: ${items}.\n\n`;
   }
 
-  prompt +=
-    `Return ONLY a raw JSON array — no markdown, no code fences, no extra text:\n` +
+  recipePrompt +=
+    `Return ONLY a JSON array (no markdown, no extra text):\n` +
     `[{"name":"str","emoji":"str","prepTime":"20 min","difficulty":"Easy|Medium|Hard","calories":0,"protein":0.0,"carbs":0.0,"fat":0.0,"ingredients":["str"],"steps":["str"]}]\n` +
     `Include 4-7 ingredients with amounts and 4-6 clear cooking steps. Accurate macros per serving.`;
 
   try {
-    const text = await callGemini([{ text: prompt }], { maxTokens: 8000, temperature: 0.7 });
-    let parsed = JSON.parse(extractJSON(text));
-    if (!Array.isArray(parsed)) {
-      const inner = Object.values(parsed).find(v => Array.isArray(v));
-      if (inner) parsed = inner;
-    }
-    if (!Array.isArray(parsed) || parsed.length === 0) throw new Error('Empty recipe response.');
+    const text   = await callGemini([{ text: recipePrompt }], { maxTokens: 3000 });
+    const parsed = JSON.parse(extractJSON(text));
+    if (!Array.isArray(parsed)) throw new Error('Unexpected response format from AI.');
 
-    // Ensure the exact-match dish is first
+    // Guarantee the exact-match recipe is first — reorder if the AI drifted
     const norm = s => s.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
-    const qn = norm(safeQuery);
-    const idx = parsed.findIndex(r => { const n = norm(r.name || ''); return n === qn || n.includes(qn) || qn.includes(n); });
-    if (idx > 0) { const [m] = parsed.splice(idx, 1); parsed.unshift(m); }
-    if (parsed.length > 0) parsed[0].name = safeQuery.replace(/\b\w/g, c => c.toUpperCase());
+    const queryNorm = norm(safeQuery);
+    const exactIdx = parsed.findIndex(r => {
+      const n = norm(r.name || '');
+      return n === queryNorm || n.includes(queryNorm) || queryNorm.includes(n);
+    });
+    if (exactIdx > 0) {
+      const [match] = parsed.splice(exactIdx, 1);
+      parsed.unshift(match);
+    }
+    // Force the first recipe's name to exactly match the query (proper title case)
+    if (parsed.length > 0) {
+      const titleCase = safeQuery.replace(/\b\w/g, c => c.toUpperCase());
+      parsed[0].name = titleCase;
+    }
 
     res.json(parsed);
   } catch (err) {
     console.error('[search-recipes]', err.message);
-    res.status(500).json({ error: 'Could not load recipes. Please try again.' });
+    res.status(500).json({ error: err.message });
   }
 });
 
