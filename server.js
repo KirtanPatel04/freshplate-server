@@ -67,7 +67,7 @@ const aiLimiter = [perMinuteLimiter, dailyLimiter];
 // ---------- Gemini helpers ----------
 
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
-const MODEL_MAIN  = 'gemini-2.0-flash';       // reliable — recipes, meal plans, scanning
+const MODEL_MAIN  = 'gemini-2.5-flash';        // reliable — recipes, meal plans, scanning
 const MODEL_CHECK = 'gemini-2.5-flash-lite';  // cheapest — yes/no safety check only
 
 async function callGemini(parts, { maxTokens = 8000, temperature = 0.7, model = MODEL_MAIN } = {}) {
