@@ -529,16 +529,16 @@ app.post('/api/ai/scan-groceries', ...aiLimiter, async (req, res) => {
   }
 });
 
-// ---------- Generate Food Image (Replicate Flux Schnell) ----------
+// ---------- Food Image (Pexels) ----------
 
-// Persistent image cache — survives server restarts
+// Persistent URL cache — survives server restarts, URLs are tiny
 const IMAGE_CACHE_FILE = '/tmp/food_image_cache.json';
 let foodImageCache = new Map();
 try {
   const saved = JSON.parse(readFileSync(IMAGE_CACHE_FILE, 'utf8'));
   foodImageCache = new Map(Object.entries(saved));
   console.log(`[image-cache] loaded ${foodImageCache.size} cached images`);
-} catch { /* first run — file doesn't exist yet */ }
+} catch { /* first run */ }
 
 function persistImageCache() {
   try {
@@ -546,71 +546,40 @@ function persistImageCache() {
   } catch (e) { console.error('[image-cache] persist error:', e.message); }
 }
 
-async function generateFoodImageB64(name) {
-  const apiKey = process.env.REPLICATE_API_KEY;
-  if (!apiKey) throw new Error('REPLICATE_API_KEY not set');
+async function fetchPexelsImageUrl(name) {
+  const apiKey = process.env.PEXELS_API_KEY;
+  if (!apiKey) throw new Error('PEXELS_API_KEY not set');
 
   const cacheKey = name.toLowerCase().trim();
   if (foodImageCache.has(cacheKey)) return foodImageCache.get(cacheKey);
 
-  const prompt =
-    `professional food photography of ${sanitize(name, 100)}, ` +
-    `overhead shot, natural lighting, white ceramic plate, restaurant quality, ` +
-    `delicious, appetizing, shallow depth of field, no text, no watermarks`;
-
-  const startRes = await fetch(
-    'https://api.replicate.com/v1/models/black-forest-labs/flux-schnell/predictions',
-    {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json', Prefer: 'wait=60' },
-      body: JSON.stringify({ input: { prompt, aspect_ratio: '1:1', output_format: 'webp', output_quality: 80, num_outputs: 1, num_inference_steps: 4 } }),
-    }
+  const query = encodeURIComponent(`${sanitize(name, 80)} food`);
+  const res = await fetch(
+    `https://api.pexels.com/v1/search?query=${query}&per_page=1&orientation=square`,
+    { headers: { Authorization: apiKey } }
   );
+  if (!res.ok) throw new Error(`Pexels API ${res.status}`);
 
-  let prediction = await startRes.json();
-  let attempts = 0;
-  while (prediction.status !== 'succeeded' && attempts < 40) {
-    if (prediction.status === 'failed' || prediction.status === 'canceled')
-      throw new Error(`Replicate ${prediction.status}: ${prediction.error ?? ''}`);
-    await new Promise(r => setTimeout(r, 1500));
-    const poll = await fetch(`https://api.replicate.com/v1/predictions/${prediction.id}`,
-      { headers: { Authorization: `Bearer ${apiKey}` } });
-    prediction = await poll.json();
-    attempts++;
-  }
+  const data = await res.json();
+  const url = data.photos?.[0]?.src?.medium;
+  if (!url) throw new Error('No photo found on Pexels');
 
-  const imageUrl = Array.isArray(prediction.output) ? prediction.output[0] : prediction.output;
-  if (!imageUrl) throw new Error('No image URL from Replicate');
-
-  const imgRes = await fetch(imageUrl);
-  if (!imgRes.ok) throw new Error('Failed to download image from Replicate');
-  const b64 = Buffer.from(await imgRes.arrayBuffer()).toString('base64');
-  foodImageCache.set(cacheKey, b64);
+  foodImageCache.set(cacheKey, url);
   persistImageCache();
-  return b64;
+  return url;
 }
 
-const imageDailyLimiter = rateLimit({
-  windowMs: 24 * 60 * 60 * 1000,
-  max: 50,
-  standardHeaders: true,
-  legacyHeaders: false,
-  validate: { xForwardedForHeader: false },
-  message: { error: 'Image generation limit reached for today.' }
-});
-
-app.post('/api/images/food', imageDailyLimiter, async (req, res) => {
+app.post('/api/images/food', async (req, res) => {
   const { name } = req.body ?? {};
   if (!name || typeof name !== 'string') return res.status(400).json({ error: 'name is required' });
-  if (!process.env.REPLICATE_API_KEY) return res.status(500).json({ error: 'REPLICATE_API_KEY is not set.' });
 
   console.log('[images/food] request:', name);
   try {
-    const b64 = await generateFoodImageB64(name);
-    res.json({ imageData: b64 });
+    const imageUrl = await fetchPexelsImageUrl(name);
+    res.json({ imageUrl });
   } catch (err) {
     console.error('[images/food]', err.message);
-    res.status(500).json({ error: 'Image generation failed. Try again shortly.' });
+    res.status(500).json({ error: 'Could not fetch food image.' });
   }
 });
 
