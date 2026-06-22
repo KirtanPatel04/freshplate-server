@@ -287,6 +287,28 @@ app.post('/auth/forgot-password', requireSupabase, async (req, res) => {
   }
 });
 
+// POST /auth/update-password  — called after user taps reset link in email
+app.post('/auth/update-password', requireSupabase, async (req, res) => {
+  try {
+    const { access_token, new_password } = req.body ?? {};
+    if (!access_token || !new_password) return res.status(400).json({ error: 'Token and password required.' });
+    if (new_password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters.' });
+
+    // Verify the recovery token and get the user
+    const { data: { user }, error: userError } = await supabase.auth.getUser(access_token);
+    if (userError || !user) return res.status(401).json({ error: 'Invalid or expired reset link. Please request a new one.' });
+
+    // Update the password
+    const { error } = await supabase.auth.admin.updateUserById(user.id, { password: new_password });
+    if (error) return res.status(400).json({ error: error.message });
+
+    res.json({ message: 'Password updated successfully.' });
+  } catch (err) {
+    console.error('[auth/update-password]', err);
+    res.status(500).json({ error: 'Server error. Please try again.' });
+  }
+});
+
 // ---------- Health ----------
 
 app.get('/health', (_req, res) => {
