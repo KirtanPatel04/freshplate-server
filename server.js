@@ -2,6 +2,10 @@ import 'dotenv/config';
 import express from 'express';
 import rateLimit from 'express-rate-limit';
 import { createClient } from '@supabase/supabase-js';
+import { WebSocket } from 'ws';
+
+// Node.js <21 doesn't have a global WebSocket — Supabase realtime requires it
+if (!globalThis.WebSocket) globalThis.WebSocket = WebSocket;
 import { readFileSync, writeFileSync } from 'fs';
 
 const app  = express();
