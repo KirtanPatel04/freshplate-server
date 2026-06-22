@@ -80,7 +80,7 @@ const MODEL_WATERFALL = [
 const MODEL_MAIN  = MODEL_WATERFALL[0];
 const MODEL_CHECK = MODEL_WATERFALL[0];
 
-async function callGemini(parts, { maxTokens = 8000, temperature = 0.7, model = MODEL_MAIN } = {}) {
+async function callGemini(parts, { maxTokens = 8000, temperature = 0.7, model = MODEL_MAIN, models = null } = {}) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error('GEMINI_API_KEY is not set on the server.');
 
@@ -89,24 +89,24 @@ async function callGemini(parts, { maxTokens = 8000, temperature = 0.7, model = 
     generationConfig: { maxOutputTokens: maxTokens, temperature }
   });
 
-  // Build the list: always start with the requested model, then append the
-  // remaining waterfall entries (deduped) so every call benefits from fallbacks.
-  const cascade = [model, ...MODEL_WATERFALL.filter(m => m !== model)];
+  // `models` overrides the full cascade — use it to pin large requests to flash only.
+  // Otherwise build the standard cascade starting from `model`.
+  const cascade = models ?? [model, ...MODEL_WATERFALL.filter(m => m !== model)];
 
+  const MAX_ATTEMPTS = 3;
   let lastError;
   for (const currentModel of cascade) {
-    for (let attempt = 1; attempt <= 2; attempt++) {
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       const res = await fetch(`${GEMINI_BASE}/${currentModel}:generateContent?key=${apiKey}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body
       });
 
-      if ((res.status === 503 || res.status === 429) && attempt < 2) {
-        await new Promise(r => setTimeout(r, attempt * 1500));
+      if ((res.status === 503 || res.status === 429) && attempt < MAX_ATTEMPTS) {
+        await new Promise(r => setTimeout(r, attempt * 2000));
         continue;
       }
 
       if (res.status === 503 || res.status === 429) {
-        // This model is overloaded — try the next one in the cascade
         lastError = new Error(`Gemini API ${res.status} on ${currentModel}`);
         break;
       }
@@ -641,12 +641,15 @@ app.post('/api/ai/generate-meal-plan', ...aiLimiter, mealPlanDailyLimiter, async
     'mealType: Breakfast, Lunch, Dinner, or Snack. Include all 4 per day. Realistic macros. Vary across days.';
 
   try {
-    // Large plans (>7 days) skip flash-lite — it has a lower output ceiling
+    // Plans >7 days are pinned to flash only — lite has a lower output ceiling
     // and routinely truncates the JSON mid-response at that length.
-    const planModel  = safeDays > 7 ? 'gemini-2.5-flash' : MODEL_MAIN;
-    const planTokens = Math.min(Math.max(Math.ceil(safeDays * 700), 6000), 16000);
+    // Passing models: [...] overrides the cascade so lite is never tried as fallback.
+    const isLargePlan = safeDays > 7;
+    const planModel   = isLargePlan ? 'gemini-2.5-flash' : MODEL_MAIN;
+    const planModels  = isLargePlan ? ['gemini-2.5-flash'] : null;
+    const planTokens  = Math.min(Math.max(Math.ceil(safeDays * 700), 6000), 16000);
 
-    let text = await callGemini([{ text: prompt }], { maxTokens: planTokens, temperature: 0.6, model: planModel });
+    let text = await callGemini([{ text: prompt }], { maxTokens: planTokens, temperature: 0.6, model: planModel, models: planModels });
     let parsed;
     try {
       parsed = JSON.parse(extractJSON(text));
@@ -657,13 +660,16 @@ app.post('/api/ai/generate-meal-plan', ...aiLimiter, mealPlanDailyLimiter, async
         '{"mealType":"Breakfast","name":"str","calories":0,"protein":0.0,"carbs":0.0,"fat":0.0,"fiber":0.0,"servingSize":"str","emoji":"str"}',
         '{"mealType":"Breakfast","name":"str","calories":0,"protein":0.0,"carbs":0.0,"fat":0.0,"servingSize":"str","emoji":"str"}'
       );
-      text   = await callGemini([{ text: compactPrompt }], { maxTokens: planTokens, temperature: 0.6, model: 'gemini-2.5-flash' });
+      text   = await callGemini([{ text: compactPrompt }], { maxTokens: planTokens, temperature: 0.6, model: 'gemini-2.5-flash', models: ['gemini-2.5-flash'] });
       parsed = JSON.parse(extractJSON(text));
     }
     res.json(parsed);
   } catch (err) {
     console.error('[generate-meal-plan]', err.message);
-    res.status(500).json({ error: err.message });
+    const friendly = (err.message.includes('503') || err.message.includes('429'))
+      ? 'The AI is currently busy with multiple requests. Please try again in 30 seconds.'
+      : err.message;
+    res.status(500).json({ error: friendly });
   }
 });
 
