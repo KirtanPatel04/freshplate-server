@@ -599,7 +599,7 @@ app.post('/api/ai/generate-meal-plan', ...aiLimiter, mealPlanDailyLimiter, async
     pantryItems = [], budget = 0, cuisines = []
   } = req.body;
 
-  const safeDays    = Math.min(Math.max(Number(days) || 7, 1), 14);
+  const safeDays    = Math.min(Math.max(Number(days) || 7, 1), 7);
   const safeCals    = Math.min(Math.max(Number(targetCalories) || 2000, 800), 5000);
   const safeProtein = Number(proteinGoal) || 150;
   const safeCarbs   = Number(carbGoal)    || 200;
@@ -641,15 +641,9 @@ app.post('/api/ai/generate-meal-plan', ...aiLimiter, mealPlanDailyLimiter, async
     'mealType: Breakfast, Lunch, Dinner, or Snack. Include all 4 per day. Realistic macros. Vary across days.';
 
   try {
-    // Plans >7 days are pinned to flash only — lite has a lower output ceiling
-    // and routinely truncates the JSON mid-response at that length.
-    // Passing models: [...] overrides the cascade so lite is never tried as fallback.
-    const isLargePlan = safeDays > 7;
-    const planModel   = isLargePlan ? 'gemini-2.5-flash' : MODEL_MAIN;
-    const planModels  = isLargePlan ? ['gemini-2.5-flash'] : null;
-    const planTokens  = Math.min(Math.max(Math.ceil(safeDays * 700), 6000), 16000);
+    const planTokens = Math.min(Math.max(Math.ceil(safeDays * 700), 4000), 6000);
 
-    let text = await callGemini([{ text: prompt }], { maxTokens: planTokens, temperature: 0.6, model: planModel, models: planModels });
+    let text = await callGemini([{ text: prompt }], { maxTokens: planTokens, temperature: 0.6 });
     let parsed;
     try {
       parsed = JSON.parse(extractJSON(text));
@@ -660,7 +654,7 @@ app.post('/api/ai/generate-meal-plan', ...aiLimiter, mealPlanDailyLimiter, async
         '{"mealType":"Breakfast","name":"str","calories":0,"protein":0.0,"carbs":0.0,"fat":0.0,"fiber":0.0,"servingSize":"str","emoji":"str"}',
         '{"mealType":"Breakfast","name":"str","calories":0,"protein":0.0,"carbs":0.0,"fat":0.0,"servingSize":"str","emoji":"str"}'
       );
-      text   = await callGemini([{ text: compactPrompt }], { maxTokens: planTokens, temperature: 0.6, model: 'gemini-2.5-flash', models: ['gemini-2.5-flash'] });
+      text   = await callGemini([{ text: compactPrompt }], { maxTokens: planTokens, temperature: 0.6 });
       parsed = JSON.parse(extractJSON(text));
     }
     res.json(parsed);
