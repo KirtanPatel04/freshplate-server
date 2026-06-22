@@ -270,19 +270,39 @@ app.post('/auth/refresh', requireSupabase, async (req, res) => {
   }
 });
 
-// POST /auth/forgot-password  — triggers a Supabase password reset email
-app.post('/auth/forgot-password', requireSupabase, async (req, res) => {
+// POST /auth/send-reset-code  — sends a 6-digit OTP to the user's email
+app.post('/auth/send-reset-code', requireSupabase, async (req, res) => {
   try {
     const { email } = req.body ?? {};
     if (!email) return res.status(400).json({ error: 'Email required.' });
 
-    // Always return success to prevent email enumeration attacks
-    await supabase.auth.resetPasswordForEmail(email.toLowerCase().trim(), {
-      redirectTo: 'freshplate://reset-password'
+    await supabase.auth.signInWithOtp({
+      email: email.toLowerCase().trim(),
+      options: { shouldCreateUser: true }
     });
-    res.json({ message: 'If an account exists for this email, a reset link has been sent.' });
+    res.json({ message: 'If an account exists, a 6-digit code has been sent.' });
   } catch (err) {
-    console.error('[auth/forgot-password]', err);
+    console.error('[auth/send-reset-code]', err);
+    res.status(500).json({ error: 'Server error. Please try again.' });
+  }
+});
+
+// POST /auth/verify-reset-code  — verifies the 6-digit code and returns an access token
+app.post('/auth/verify-reset-code', requireSupabase, async (req, res) => {
+  try {
+    const { email, code } = req.body ?? {};
+    if (!email || !code) return res.status(400).json({ error: 'Email and code required.' });
+
+    const { data, error } = await supabase.auth.verifyOtp({
+      email: email.toLowerCase().trim(),
+      token: code,
+      type: 'email'
+    });
+    if (error || !data?.session) return res.status(400).json({ error: 'Incorrect or expired code. Please try again.' });
+
+    res.json({ access_token: data.session.access_token });
+  } catch (err) {
+    console.error('[auth/verify-reset-code]', err);
     res.status(500).json({ error: 'Server error. Please try again.' });
   }
 });
