@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import rateLimit from 'express-rate-limit';
+import { createClient } from '@supabase/supabase-js';
 import { readFileSync, writeFileSync } from 'fs';
 
 const app  = express();
@@ -119,6 +120,168 @@ function sanitize(str, maxLen = 300) {
   if (typeof str !== 'string') return '';
   return str.replace(/[<>'"]/g, '').slice(0, maxLen).trim();
 }
+
+// ---------- Supabase client ----------
+
+const supabase = (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY)
+  ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false }
+    })
+  : null;
+
+function requireSupabase(req, res, next) {
+  if (!supabase) return res.status(503).json({ error: 'Auth service not configured on the server.' });
+  next();
+}
+
+// ---------- Auth routes ----------
+
+// POST /auth/signup
+app.post('/auth/signup', requireSupabase, async (req, res) => {
+  try {
+    const { email, password } = req.body ?? {};
+    if (!email || !password) return res.status(400).json({ error: 'Email and password required.' });
+
+    const { data: created, error: createErr } = await supabase.auth.admin.createUser({
+      email: email.toLowerCase().trim(),
+      password,
+      email_confirm: true
+    });
+    if (createErr) {
+      const msg = createErr.message ?? '';
+      if (msg.toLowerCase().includes('already') || msg.toLowerCase().includes('exists')) {
+        return res.status(400).json({ error: 'An account with this email already exists.' });
+      }
+      return res.status(400).json({ error: msg || 'Could not create account.' });
+    }
+
+    const { data: session, error: signInErr } = await supabase.auth.signInWithPassword({
+      email: email.toLowerCase().trim(), password
+    });
+    if (signInErr) return res.status(400).json({ error: signInErr.message });
+
+    res.json({
+      access_token:  session.session.access_token,
+      refresh_token: session.session.refresh_token,
+      user_id:       session.user.id,
+      email:         session.user.email
+    });
+  } catch (err) {
+    console.error('[auth/signup]', err);
+    res.status(500).json({ error: 'Server error during sign up.' });
+  }
+});
+
+// POST /auth/signin
+app.post('/auth/signin', requireSupabase, async (req, res) => {
+  try {
+    const { email, password } = req.body ?? {};
+    if (!email || !password) return res.status(400).json({ error: 'Email and password required.' });
+
+    const { data, error } = await supabase.auth.signInWithPassword({
+      email: email.toLowerCase().trim(), password
+    });
+    if (error) return res.status(401).json({ error: 'Invalid email or password.' });
+
+    res.json({
+      access_token:  data.session.access_token,
+      refresh_token: data.session.refresh_token,
+      user_id:       data.user.id,
+      email:         data.user.email
+    });
+  } catch (err) {
+    console.error('[auth/signin]', err);
+    res.status(500).json({ error: 'Server error during sign in.' });
+  }
+});
+
+// POST /auth/google  — iOS sends the Google ID token from its PKCE flow
+app.post('/auth/google', requireSupabase, async (req, res) => {
+  try {
+    const { id_token } = req.body ?? {};
+    if (!id_token) return res.status(400).json({ error: 'Google ID token required.' });
+
+    const { data, error } = await supabase.auth.signInWithIdToken({
+      provider: 'google',
+      token: id_token
+    });
+    if (error) return res.status(400).json({ error: error.message });
+
+    const meta = data.user.user_metadata ?? {};
+    res.json({
+      access_token:  data.session.access_token,
+      refresh_token: data.session.refresh_token,
+      user_id:       data.user.id,
+      email:         data.user.email ?? '',
+      name:          meta.full_name ?? meta.name ?? ''
+    });
+  } catch (err) {
+    console.error('[auth/google]', err);
+    res.status(500).json({ error: 'Server error during Google sign in.' });
+  }
+});
+
+// POST /auth/apple  — iOS sends the Apple identity token from Sign in with Apple
+app.post('/auth/apple', requireSupabase, async (req, res) => {
+  try {
+    const { identity_token } = req.body ?? {};
+    if (!identity_token) return res.status(400).json({ error: 'Apple identity token required.' });
+
+    const { data, error } = await supabase.auth.signInWithIdToken({
+      provider: 'apple',
+      token: identity_token
+    });
+    if (error) return res.status(400).json({ error: error.message });
+
+    const meta = data.user.user_metadata ?? {};
+    res.json({
+      access_token:  data.session.access_token,
+      refresh_token: data.session.refresh_token,
+      user_id:       data.user.id,
+      email:         data.user.email ?? '',
+      name:          meta.full_name ?? meta.name ?? ''
+    });
+  } catch (err) {
+    console.error('[auth/apple]', err);
+    res.status(500).json({ error: 'Server error during Apple sign in.' });
+  }
+});
+
+// POST /auth/refresh
+app.post('/auth/refresh', requireSupabase, async (req, res) => {
+  try {
+    const { refresh_token } = req.body ?? {};
+    if (!refresh_token) return res.status(400).json({ error: 'Refresh token required.' });
+
+    const { data, error } = await supabase.auth.refreshSession({ refresh_token });
+    if (error) return res.status(401).json({ error: 'Session expired. Please sign in again.' });
+
+    res.json({
+      access_token:  data.session.access_token,
+      refresh_token: data.session.refresh_token
+    });
+  } catch (err) {
+    console.error('[auth/refresh]', err);
+    res.status(500).json({ error: 'Server error during token refresh.' });
+  }
+});
+
+// POST /auth/forgot-password  — triggers a Supabase password reset email
+app.post('/auth/forgot-password', requireSupabase, async (req, res) => {
+  try {
+    const { email } = req.body ?? {};
+    if (!email) return res.status(400).json({ error: 'Email required.' });
+
+    // Always return success to prevent email enumeration attacks
+    await supabase.auth.resetPasswordForEmail(email.toLowerCase().trim(), {
+      redirectTo: 'freshplate://reset-password'
+    });
+    res.json({ message: 'If an account exists for this email, a reset link has been sent.' });
+  } catch (err) {
+    console.error('[auth/forgot-password]', err);
+    res.status(500).json({ error: 'Server error. Please try again.' });
+  }
+});
 
 // ---------- Health ----------
 
@@ -355,10 +518,26 @@ app.post('/api/ai/generate-meal-plan', ...aiLimiter, mealPlanDailyLimiter, async
     prompt += ` Cuisines to rotate: ${cuisines.slice(0, 5).map(c => sanitize(String(c), 30)).join(', ')}.`;
   }
   if (Array.isArray(pantryItems) && pantryItems.length > 0) {
-    const items = pantryItems.slice(0, 12).map(i => sanitize(String(i?.name ?? i), 50)).join(', ');
-    prompt += ` Prioritise pantry items: ${items}.`;
+    const hasExpiry = pantryItems.some(i => i?.expiresInDays !== undefined && i.expiresInDays >= 0);
+    const items = pantryItems.map(i => {
+      const name = sanitize(String(i?.name ?? i), 50);
+      return (hasExpiry && i?.expiresInDays !== undefined && i.expiresInDays >= 0)
+        ? `${name} (expires in ${i.expiresInDays}d)` : name;
+    }).join(', ');
+    if (hasExpiry) {
+      prompt += ` The user already has these pantry items — USE ALL OF THEM in recipes, prioritising those expiring soonest: ${items}. Build every meal around what is already available. Any additional ingredients NOT in this list must be minimal and kept within the grocery budget.`;
+    } else {
+      prompt += ` The user already has these pantry items — USE ALL OF THEM across the meal plan: ${items}. Build every meal primarily around these ingredients. Any extra ingredients not in this list are what the user will need to buy.`;
+    }
   }
-  if (safeBudget > 0) prompt += ` Budget: ~$${Math.round(safeBudget)}.`;
+  if (safeBudget > 0) {
+    const pantryCount = Array.isArray(pantryItems) ? pantryItems.length : 0;
+    if (pantryCount > 0) {
+      prompt += ` Weekly grocery budget for additional ingredients (not already in pantry): ~$${Math.round(safeBudget)}. Keep the total cost of non-pantry ingredients within this budget.`;
+    } else {
+      prompt += ` Weekly grocery budget: ~$${Math.round(safeBudget)}.`;
+    }
+  }
 
   prompt +=
     '\nReturn ONLY compact JSON:\n' +
@@ -499,32 +678,143 @@ app.post('/api/ai/scan-receipt', ...aiLimiter, async (req, res) => {
   }
 });
 
-// ---------- Scan Groceries (photo of multiple items) ----------
+// ---------- Scan Groceries / Fridge (photo of multiple items) ----------
 
 app.post('/api/ai/scan-groceries', ...aiLimiter, async (req, res) => {
-  const { image, mimeType = 'image/jpeg' } = req.body;
-  console.log('[scan-groceries] request received');
+  const { image, mimeType = 'image/jpeg', mode = 'groceries' } = req.body;
+  console.log('[scan-groceries] request received, mode:', mode);
   if (!image) return res.status(400).json({ error: 'image is required' });
+
+  const isFridge = mode === 'fridge';
+  const promptText = isFridge
+    ? 'Look at everything visible inside this refrigerator. Identify every distinct food item stored on shelves, in drawers, and in the door. ' +
+      'For each item estimate a realistic quantity based on what you can see. ' +
+      'Return ONLY a JSON array with no extra text or markdown: ' +
+      '[{"name":"str","emoji":"str","quantity":1.0,"unit":"pcs","category":"produce|proteins|dairy|grains|condiments|snacks|beverages|frozen|other"}] ' +
+      'Use sensible units: pcs for countable items, g/kg for loose items, L/mL for liquids. ' +
+      'If no food items are visible return [].'
+    : 'Look at this photo of groceries. Identify every distinct food item visible. ' +
+      'For each item estimate the quantity based on what you can see (count individual pieces, estimate weight/volume for bulk). ' +
+      'Return ONLY a JSON array with no extra text or markdown: ' +
+      '[{"name":"str","emoji":"str","quantity":1.0,"unit":"pcs","category":"produce|proteins|dairy|grains|condiments|snacks|beverages|frozen|other"}] ' +
+      'Use sensible units: pcs for countable items, g/kg for loose items, L/mL for liquids, bags/boxes for packaged items. ' +
+      'If no food items are visible return [].';
 
   try {
     const text = await callGemini(
-      [
-        { inlineData: { mimeType, data: image } },
-        {
-          text: 'Look at this photo of groceries. Identify every distinct food item visible. ' +
-                'For each item estimate the quantity based on what you can see (count individual pieces, estimate weight/volume for bulk). ' +
-                'Return ONLY a JSON array with no extra text or markdown: ' +
-                '[{"name":"str","emoji":"str","quantity":1.0,"unit":"pcs","category":"produce|proteins|dairy|grains|condiments|snacks|beverages|frozen|other"}] ' +
-                'Use sensible units: pcs for countable items, g/kg for loose items, L/mL for liquids, bags/boxes for packaged items. ' +
-                'If no food items are visible return [].'
-        }
-      ],
+      [{ inlineData: { mimeType, data: image } }, { text: promptText }],
       { maxTokens: 800, temperature: 0.2 }
     );
     const parsed = JSON.parse(extractJSON(text));
     res.json({ items: Array.isArray(parsed) ? parsed : [] });
   } catch (err) {
     console.error('[scan-groceries]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------- Weekly Nutrition Report ----------
+
+// ---------- Cook Tonight (suggest meals from pantry) ----------
+
+app.post('/api/ai/suggest-from-pantry', ...aiLimiter, async (req, res) => {
+  const { pantryItems = [], restrictions = [], count = 2 } = req.body;
+
+  const safeCount = Math.min(Math.max(Number(count) || 2, 1), 3);
+  const items = (Array.isArray(pantryItems) ? pantryItems : []).slice(0, 20)
+    .map(i => {
+      const name = sanitize(String(i?.name ?? i), 40);
+      return (i?.expiresInDays !== undefined && i.expiresInDays >= 0)
+        ? `${name} (expires in ${i.expiresInDays}d)`
+        : name;
+    })
+    .join(', ');
+
+  if (!items) return res.status(400).json({ error: 'pantryItems is required' });
+
+  const restrictionStr = Array.isArray(restrictions) && restrictions.length > 0
+    ? ` Dietary restrictions: ${restrictions.slice(0, 5).map(r => sanitize(String(r), 30)).join(', ')}.`
+    : '';
+
+  const prompt =
+    `I have these pantry items: ${items}.${restrictionStr}\n` +
+    `Suggest ${safeCount} complete meals I can make tonight using primarily these ingredients. ` +
+    'Prioritize items expiring soonest. Each meal should be practical and quick.\n' +
+    'Return ONLY compact JSON:\n' +
+    '{"suggestions":[{"name":"str","emoji":"str","description":"str","keyIngredients":["str"],"cookTime":"str"}]}\n' +
+    'description: 1 engaging sentence. keyIngredients: 3-4 main pantry items used. cookTime: e.g. "20 min".';
+
+  try {
+    const text = await callGemini([{ text: prompt }], { maxTokens: 600, temperature: 0.7 });
+    res.json(JSON.parse(extractJSON(text)));
+  } catch (err) {
+    console.error('[suggest-from-pantry]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------- Weekly Nutrition Report ----------
+
+const weeklyReportLimiter = rateLimit({
+  windowMs: 24 * 60 * 60 * 1000,
+  max: 3,
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
+  message: { error: 'Weekly report limit reached for today.' }
+});
+
+app.post('/api/ai/weekly-nutrition-report', ...aiLimiter, weeklyReportLimiter, async (req, res) => {
+  console.log('[weekly-nutrition-report] request received');
+  const { name = 'there', weeklyData = [], goals = {} } = req.body;
+
+  const safeName = sanitize(String(name), 40);
+  const calGoal  = Number(goals.calories) || 2000;
+  const proGoal  = Number(goals.protein)  || 150;
+
+  // Build a readable summary of the week
+  const daySummaries = weeklyData.slice(0, 7).map(d => {
+    const cal = Number(d.calories) || 0;
+    const pro = Number(d.protein)  || 0;
+    const day = sanitize(String(d.dayName || ''), 15);
+    return `${day}: ${cal} kcal, ${Math.round(pro)}g protein`;
+  }).join('\n');
+
+  const daysHitCalories = weeklyData.filter(d => {
+    const cal = Number(d.calories) || 0;
+    return cal >= calGoal * 0.85 && cal <= calGoal * 1.15;
+  }).length;
+
+  const daysHitProtein = weeklyData.filter(d => Number(d.protein) >= proGoal * 0.9).length;
+
+  const prompt =
+    `You are the nutrition coach inside FreshPlate, a meal-tracking app.\n` +
+    `Write a personalized weekly nutrition summary for ${safeName}.\n\n` +
+    `WEEKLY DATA (last 7 days):\n${daySummaries}\n\n` +
+    `GOALS: ${calGoal} kcal/day, ${proGoal}g protein/day\n` +
+    `Hit calorie target: ${daysHitCalories}/7 days\n` +
+    `Hit protein target: ${daysHitProtein}/7 days\n\n` +
+    `Return ONLY compact JSON (no markdown):\n` +
+    `{"headline":"str","summary":"str","highlights":["str","str","str"],"tip":"str"}\n\n` +
+    `RULES:\n` +
+    `- headline: short punchy title, max 8 words, e.g. "Strong week — protein was your superpower"\n` +
+    `- summary: 2 sentences, warm and specific, mention actual numbers\n` +
+    `- highlights: exactly 3 bullet-point insights (what went well, what to watch, a pattern noticed)\n` +
+    `- tip: one concrete actionable tip for next week\n` +
+    `- Never mention "AI", "Gemini", or "generated" — write as a real coach\n` +
+    `- Friendly, encouraging tone; never guilt-tripping`;
+
+  try {
+    const text   = await callGemini([{ text: prompt }], { maxTokens: 600, temperature: 0.7 });
+    const parsed = JSON.parse(extractJSON(text));
+    res.json({
+      headline:   sanitize(String(parsed.headline  || ''), 120),
+      summary:    sanitize(String(parsed.summary   || ''), 400),
+      highlights: (Array.isArray(parsed.highlights) ? parsed.highlights : []).slice(0, 3).map(h => sanitize(String(h), 200)),
+      tip:        sanitize(String(parsed.tip        || ''), 200)
+    });
+  } catch (err) {
+    console.error('[weekly-nutrition-report]', err.message);
     res.status(500).json({ error: err.message });
   }
 });
