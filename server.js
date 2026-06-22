@@ -72,8 +72,14 @@ const aiLimiter = [perMinuteLimiter, dailyLimiter];
 // ---------- Gemini helpers ----------
 
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
-const MODEL_MAIN  = 'gemini-2.5-flash-lite';   // fast + cheap — retry handles 503 spikes
-const MODEL_CHECK = 'gemini-2.5-flash-lite';  // cheapest — yes/no safety check only
+// Waterfall: try each model in order; move to next on quota/overload errors.
+const MODEL_WATERFALL = [
+  'gemini-2.5-flash-lite',  // primary — cheapest, fastest
+  'gemini-2.0-flash-lite',  // fallback — prev-gen lite, separate quota pool
+  'gemini-1.5-flash',       // last resort — battle-tested, generous free quota
+];
+const MODEL_MAIN  = MODEL_WATERFALL[0];
+const MODEL_CHECK = MODEL_WATERFALL[0];
 
 async function callGemini(parts, { maxTokens = 8000, temperature = 0.7, model = MODEL_MAIN } = {}) {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -84,24 +90,39 @@ async function callGemini(parts, { maxTokens = 8000, temperature = 0.7, model = 
     generationConfig: { maxOutputTokens: maxTokens, temperature }
   });
 
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    const res = await fetch(`${GEMINI_BASE}/${model}:generateContent?key=${apiKey}`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body
-    });
+  // Build the list: always start with the requested model, then append the
+  // remaining waterfall entries (deduped) so every call benefits from fallbacks.
+  const cascade = [model, ...MODEL_WATERFALL.filter(m => m !== model)];
 
-    if ((res.status === 503 || res.status === 429) && attempt < 3) {
-      await new Promise(r => setTimeout(r, attempt * 1500));
-      continue;
+  let lastError;
+  for (const currentModel of cascade) {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const res = await fetch(`${GEMINI_BASE}/${currentModel}:generateContent?key=${apiKey}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body
+      });
+
+      if ((res.status === 503 || res.status === 429) && attempt < 2) {
+        await new Promise(r => setTimeout(r, attempt * 1500));
+        continue;
+      }
+
+      if (res.status === 503 || res.status === 429) {
+        // This model is overloaded — try the next one in the cascade
+        lastError = new Error(`Gemini API ${res.status} on ${currentModel}`);
+        break;
+      }
+
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`Gemini API ${res.status}: ${text}`);
+      }
+
+      const data = await res.json();
+      return data.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
     }
-
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`Gemini API ${res.status}: ${text}`);
-    }
-
-    const data = await res.json();
-    return data.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
   }
+
+  throw lastError ?? new Error('All Gemini models unavailable');
 }
 
 // Extract first JSON object or array from text (tolerates model preamble)
