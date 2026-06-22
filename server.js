@@ -75,8 +75,7 @@ const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
 // Waterfall: try each model in order; move to next on quota/overload errors.
 const MODEL_WATERFALL = [
   'gemini-2.5-flash-lite',  // primary — cheapest, fastest
-  'gemini-2.0-flash-lite',  // fallback — prev-gen lite, separate quota pool
-  'gemini-1.5-flash',       // last resort — battle-tested, generous free quota
+  'gemini-2.5-flash',       // fallback — same generation, higher output limits
 ];
 const MODEL_MAIN  = MODEL_WATERFALL[0];
 const MODEL_CHECK = MODEL_WATERFALL[0];
@@ -109,6 +108,14 @@ async function callGemini(parts, { maxTokens = 8000, temperature = 0.7, model = 
       if (res.status === 503 || res.status === 429) {
         // This model is overloaded — try the next one in the cascade
         lastError = new Error(`Gemini API ${res.status} on ${currentModel}`);
+        break;
+      }
+
+      // 400 usually means this model doesn't support the request (e.g. no vision) — fall through
+      if (res.status === 400) {
+        const text = await res.text();
+        lastError = new Error(`Gemini API 400 on ${currentModel}`);
+        console.warn(`[callGemini] ${currentModel} returned 400, trying next model`);
         break;
       }
 
@@ -523,8 +530,16 @@ app.post('/api/ai/search-recipes', ...aiLimiter, recipeDailyLimiter, async (req,
     `Include 4-7 ingredients with amounts and 4-6 clear cooking steps. Accurate macros per serving.`;
 
   try {
-    const text   = await callGemini([{ text: recipePrompt }], { maxTokens: 3000 });
-    const parsed = JSON.parse(extractJSON(text));
+    let text = await callGemini([{ text: recipePrompt }], { maxTokens: 5000 });
+    let parsed;
+    try {
+      parsed = JSON.parse(extractJSON(text));
+    } catch (_) {
+      // JSON truncated — retry once on flash with same prompt
+      console.warn('[search-recipes] JSON truncated, retrying on flash');
+      text   = await callGemini([{ text: recipePrompt }], { maxTokens: 5000, model: 'gemini-2.5-flash' });
+      parsed = JSON.parse(extractJSON(text));
+    }
     if (!Array.isArray(parsed)) throw new Error('Unexpected response format from AI.');
 
     // Guarantee the exact-match recipe is first — reorder if the AI drifted
@@ -626,8 +641,26 @@ app.post('/api/ai/generate-meal-plan', ...aiLimiter, mealPlanDailyLimiter, async
     'mealType: Breakfast, Lunch, Dinner, or Snack. Include all 4 per day. Realistic macros. Vary across days.';
 
   try {
-    const text = await callGemini([{ text: prompt }], { maxTokens: 6000, temperature: 0.6 });
-    res.json(JSON.parse(extractJSON(text)));
+    // Large plans (>7 days) skip flash-lite — it has a lower output ceiling
+    // and routinely truncates the JSON mid-response at that length.
+    const planModel  = safeDays > 7 ? 'gemini-2.5-flash' : MODEL_MAIN;
+    const planTokens = Math.min(Math.max(Math.ceil(safeDays * 700), 6000), 16000);
+
+    let text = await callGemini([{ text: prompt }], { maxTokens: planTokens, temperature: 0.6, model: planModel });
+    let parsed;
+    try {
+      parsed = JSON.parse(extractJSON(text));
+    } catch (_) {
+      // JSON was truncated — retry once with a shorter, no-fiber prompt on flash
+      console.warn('[generate-meal-plan] JSON truncated, retrying with compact prompt');
+      const compactPrompt = prompt.replace(
+        '{"mealType":"Breakfast","name":"str","calories":0,"protein":0.0,"carbs":0.0,"fat":0.0,"fiber":0.0,"servingSize":"str","emoji":"str"}',
+        '{"mealType":"Breakfast","name":"str","calories":0,"protein":0.0,"carbs":0.0,"fat":0.0,"servingSize":"str","emoji":"str"}'
+      );
+      text   = await callGemini([{ text: compactPrompt }], { maxTokens: planTokens, temperature: 0.6, model: 'gemini-2.5-flash' });
+      parsed = JSON.parse(extractJSON(text));
+    }
+    res.json(parsed);
   } catch (err) {
     console.error('[generate-meal-plan]', err.message);
     res.status(500).json({ error: err.message });
