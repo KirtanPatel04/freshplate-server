@@ -812,18 +812,23 @@ const weeklyReportLimiter = rateLimit({
 
 app.post('/api/ai/weekly-nutrition-report', ...aiLimiter, weeklyReportLimiter, async (req, res) => {
   console.log('[weekly-nutrition-report] request received');
-  const { name = 'there', weeklyData = [], goals = {} } = req.body;
+  const { name = 'there', weeklyData = [], goals = {}, pantry = {}, daysNotLogged = 0 } = req.body;
 
-  const safeName = sanitize(String(name), 40);
-  const calGoal  = Number(goals.calories) || 2000;
-  const proGoal  = Number(goals.protein)  || 150;
+  const safeName          = sanitize(String(name), 40);
+  const calGoal           = Number(goals.calories)               || 2000;
+  const proGoal           = Number(goals.protein)                || 150;
+  const expiredThisWeek   = Math.max(0, Number(pantry.expiredThisWeek)       || 0);
+  const expiringNextThree = Math.max(0, Number(pantry.expiringNextThreeDays) || 0);
+  const missedDays        = Math.max(0, Math.min(7, Number(daysNotLogged)    || 0));
 
   // Build a readable summary of the week
   const daySummaries = weeklyData.slice(0, 7).map(d => {
     const cal = Number(d.calories) || 0;
     const pro = Number(d.protein)  || 0;
     const day = sanitize(String(d.dayName || ''), 15);
-    return `${day}: ${cal} kcal, ${Math.round(pro)}g protein`;
+    return cal === 0
+      ? `${day}: no food logged`
+      : `${day}: ${cal} kcal, ${Math.round(pro)}g protein`;
   }).join('\n');
 
   const daysHitCalories = weeklyData.filter(d => {
@@ -833,20 +838,33 @@ app.post('/api/ai/weekly-nutrition-report', ...aiLimiter, weeklyReportLimiter, a
 
   const daysHitProtein = weeklyData.filter(d => Number(d.protein) >= proGoal * 0.9).length;
 
+  const pantryLine = expiredThisWeek > 0
+    ? `Pantry: ${expiredThisWeek} item${expiredThisWeek > 1 ? 's' : ''} expired this week (food wasted)`
+    : `Pantry: no items expired this week (great job using food up!)`;
+  const expiryWarning = expiringNextThree > 0
+    ? `${expiringNextThree} item${expiringNextThree > 1 ? 's' : ''} expiring in the next 3 days`
+    : `No items expiring in the next 3 days`;
+
   const prompt =
-    `You are the nutrition coach inside FreshPlate, a meal-tracking app.\n` +
-    `Write a personalized weekly nutrition summary for ${safeName}.\n\n` +
-    `WEEKLY DATA (last 7 days):\n${daySummaries}\n\n` +
+    `You are the nutrition coach inside FreshPlate, a meal-tracking and pantry app.\n` +
+    `Write a personalized weekly summary for ${safeName} covering nutrition AND food waste.\n\n` +
+    `WEEKLY NUTRITION (last 7 days):\n${daySummaries}\n\n` +
     `GOALS: ${calGoal} kcal/day, ${proGoal}g protein/day\n` +
     `Hit calorie target: ${daysHitCalories}/7 days\n` +
-    `Hit protein target: ${daysHitProtein}/7 days\n\n` +
+    `Hit protein target: ${daysHitProtein}/7 days\n` +
+    `Days with no food logged: ${missedDays}/7\n\n` +
+    `PANTRY & FOOD WASTE:\n` +
+    `${pantryLine}\n` +
+    `${expiryWarning}\n\n` +
     `Return ONLY compact JSON (no markdown):\n` +
     `{"headline":"str","summary":"str","highlights":["str","str","str"],"tip":"str"}\n\n` +
     `RULES:\n` +
-    `- headline: short punchy title, max 8 words, e.g. "Strong week — protein was your superpower"\n` +
-    `- summary: 2 sentences, warm and specific, mention actual numbers\n` +
-    `- highlights: exactly 3 bullet-point insights (what went well, what to watch, a pattern noticed)\n` +
-    `- tip: one concrete actionable tip for next week\n` +
+    `- headline: short punchy title, max 8 words\n` +
+    `- summary: 2 sentences — one on nutrition, one on pantry/food waste; warm and specific with actual numbers\n` +
+    `- highlights: exactly 3 insights covering a mix of: nutrition wins/misses, logging consistency, food waste or savings\n` +
+    `- tip: one concrete actionable tip for next week (could be nutrition OR reducing food waste)\n` +
+    `- If items expired, gently acknowledge it and suggest a fix; if none expired, celebrate it\n` +
+    `- If logging was missed, note it encouragingly without guilt\n` +
     `- Never mention "AI", "Gemini", or "generated" — write as a real coach\n` +
     `- Friendly, encouraging tone; never guilt-tripping`;
 
