@@ -106,18 +106,31 @@ async function callGemini(parts, { maxTokens = 8000, temperature = 0.7, model = 
 
 // Extract first JSON object or array from text (tolerates model preamble)
 function extractJSON(text) {
-  const arrStart = text.indexOf('[');
-  const objStart = text.indexOf('{');
+  const arrIdx = text.indexOf('[');
+  const objIdx = text.indexOf('{');
 
-  if (arrStart !== -1 && (objStart === -1 || arrStart < objStart)) {
-    const end = text.lastIndexOf(']');
-    if (end !== -1) return text.slice(arrStart, end + 1);
+  let start, openChar, closeChar;
+  if (arrIdx !== -1 && (objIdx === -1 || arrIdx < objIdx)) {
+    start = arrIdx; openChar = '['; closeChar = ']';
+  } else if (objIdx !== -1) {
+    start = objIdx; openChar = '{'; closeChar = '}';
+  } else {
+    return text;
   }
-  if (objStart !== -1) {
-    const end = text.lastIndexOf('}');
-    if (end !== -1) return text.slice(objStart, end + 1);
+
+  // Walk the string with proper bracket + string tracking so a ] inside
+  // a step like "Season [to taste]" never terminates the extraction early.
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (esc)              { esc = false; continue; }
+    if (ch === '\\' && inStr) { esc = true;  continue; }
+    if (ch === '"')       { inStr = !inStr;  continue; }
+    if (inStr)            continue;
+    if (ch === openChar)  depth++;
+    else if (ch === closeChar) { if (--depth === 0) return text.slice(start, i + 1); }
   }
-  return text;
+  return text.slice(start); // truncated — return what we have
 }
 
 function sanitize(str, maxLen = 300) {
@@ -489,7 +502,7 @@ app.post('/api/ai/search-recipes', ...aiLimiter, recipeDailyLimiter, async (req,
     `Include 4-7 ingredients with amounts and 4-6 clear cooking steps. Accurate macros per serving.`;
 
   try {
-    const text   = await callGemini([{ text: recipePrompt }], { maxTokens: 16000 });
+    const text   = await callGemini([{ text: recipePrompt }], { maxTokens: 3000 });
     const parsed = JSON.parse(extractJSON(text));
     if (!Array.isArray(parsed)) throw new Error('Unexpected response format from AI.');
 
@@ -592,7 +605,7 @@ app.post('/api/ai/generate-meal-plan', ...aiLimiter, mealPlanDailyLimiter, async
     'mealType: Breakfast, Lunch, Dinner, or Snack. Include all 4 per day. Realistic macros. Vary across days.';
 
   try {
-    const text = await callGemini([{ text: prompt }], { maxTokens: 16000, temperature: 0.6 });
+    const text = await callGemini([{ text: prompt }], { maxTokens: 6000, temperature: 0.6 });
     res.json(JSON.parse(extractJSON(text)));
   } catch (err) {
     console.error('[generate-meal-plan]', err.message);
