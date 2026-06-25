@@ -11,26 +11,47 @@ import { readFileSync, writeFileSync } from 'fs';
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
+// Prevent Railway from restarting the server on unhandled rejections
+process.on('uncaughtException',   err    => console.error('[uncaughtException]', err));
+process.on('unhandledRejection',  reason => console.error('[unhandledRejection]', reason));
+
 // ---------- Middleware ----------
 
 app.set('trust proxy', 1);
 app.use(express.json({ limit: '25mb' }));
+
+// ── Per-user rate limiting ─────────────────────────────────────────────────────
+// Use a fast hash of the Authorization token as the rate-limit key so that every
+// authenticated user gets their own independent bucket regardless of shared IPs
+// (NAT, corporate proxy, etc.).  Falls back to IP for unauthenticated requests.
+function userKey(req) {
+  const auth = req.headers['authorization'];
+  if (auth?.startsWith('Bearer ')) {
+    const token = auth.slice(7, 57); // first 50 chars is plenty for a unique hash
+    let h = 5381;
+    for (let i = 0; i < token.length; i++) h = ((h << 5) + h + token.charCodeAt(i)) | 0;
+    return 'u:' + (h >>> 0).toString(36);
+  }
+  return 'ip:' + (req.ip ?? 'unknown');
+}
 
 // ── Rate limiters ──────────────────────────────────────────────────────────────
 // Tier 1 — per-minute burst guard (all AI endpoints)
 const perMinuteLimiter = rateLimit({
   windowMs: 60_000,
   max: 30,
+  keyGenerator: userKey,
   standardHeaders: true,
   legacyHeaders: false,
   validate: { xForwardedForHeader: false },
   message: { error: 'Too many requests. Please slow down.' }
 });
 
-// Tier 2 — per-day overall AI budget (200 calls/IP/day)
+// Tier 2 — per-day overall AI budget (200 calls/user/day)
 const dailyLimiter = rateLimit({
   windowMs: 24 * 60 * 60 * 1000,
   max: 200,
+  keyGenerator: userKey,
   standardHeaders: true,
   legacyHeaders: false,
   validate: { xForwardedForHeader: false },
@@ -41,6 +62,7 @@ const dailyLimiter = rateLimit({
 const mealPlanDailyLimiter = rateLimit({
   windowMs: 24 * 60 * 60 * 1000,
   max: 5,
+  keyGenerator: userKey,
   standardHeaders: true,
   legacyHeaders: false,
   validate: { xForwardedForHeader: false },
@@ -50,6 +72,7 @@ const mealPlanDailyLimiter = rateLimit({
 const recipeDailyLimiter = rateLimit({
   windowMs: 24 * 60 * 60 * 1000,
   max: 30,
+  keyGenerator: userKey,
   standardHeaders: true,
   legacyHeaders: false,
   validate: { xForwardedForHeader: false },
@@ -59,6 +82,7 @@ const recipeDailyLimiter = rateLimit({
 const notifDailyLimiter = rateLimit({
   windowMs: 24 * 60 * 60 * 1000,
   max: 10,
+  keyGenerator: userKey,
   standardHeaders: true,
   legacyHeaders: false,
   validate: { xForwardedForHeader: false },
@@ -76,13 +100,58 @@ const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
 const MODEL_WATERFALL = [
   'gemini-2.5-flash-lite',  // primary — cheapest, fastest
   'gemini-2.5-flash',       // fallback — same generation, higher output limits
+  'gemini-3.1-flash-lite',  // last resort — newer generation, higher quality
 ];
 const MODEL_MAIN  = MODEL_WATERFALL[0];
 const MODEL_CHECK = MODEL_WATERFALL[0];
 
+// ── API key rotation ───────────────────────────────────────────────────────────
+// Set GEMINI_API_KEYS=key1,key2,key3 in .env to spread load across multiple keys
+// and multiply your effective quota (e.g. 3 keys × 10 RPM = 30 RPM effective).
+// Falls back to the single GEMINI_API_KEY for backward compat.
+const GEMINI_KEYS = (process.env.GEMINI_API_KEYS ?? process.env.GEMINI_API_KEY ?? '')
+  .split(',').map(k => k.trim()).filter(Boolean);
+let _keyIdx = 0;
+function pickApiKey() {
+  if (!GEMINI_KEYS.length) throw new Error('GEMINI_API_KEY is not set on the server.');
+  const key = GEMINI_KEYS[_keyIdx % GEMINI_KEYS.length];
+  _keyIdx = (_keyIdx + 1) % GEMINI_KEYS.length;
+  return key;
+}
+
+// ── Concurrency limiter ────────────────────────────────────────────────────────
+// Prevents a burst of users from flooding the Gemini API simultaneously.
+// Excess requests queue here and are served in order as slots free up.
+// Tune GEMINI_MAX_CONCURRENT ≈ (total RPM across all keys / avg seconds per call).
+class Semaphore {
+  #max; #active = 0; #queue = [];
+  constructor(max) { this.#max = max; }
+  acquire() {
+    if (this.#active < this.#max) { this.#active++; return Promise.resolve(); }
+    return new Promise(r => this.#queue.push(r)).then(() => { this.#active++; });
+  }
+  release() { this.#active--; if (this.#queue.length) this.#queue.shift()(); }
+}
+const geminiSem = new Semaphore(Number(process.env.GEMINI_MAX_CONCURRENT) || 20);
+
+// ── Recipe search cache ────────────────────────────────────────────────────────
+// If two users search for the same dish, only one Gemini call is made.
+// Results are reused for 1 hour, then evicted so content stays fresh.
+const _recipeCache = new Map();
+const RECIPE_TTL = 60 * 60 * 1000; // 1 hour
+
+function getCachedRecipes(key) {
+  const e = _recipeCache.get(key);
+  if (!e || Date.now() > e.exp) { _recipeCache.delete(key); return null; }
+  return e.data;
+}
+function setCachedRecipes(key, data) {
+  if (_recipeCache.size >= 500) _recipeCache.delete(_recipeCache.keys().next().value);
+  _recipeCache.set(key, { data, exp: Date.now() + RECIPE_TTL });
+}
+
 async function callGemini(parts, { maxTokens = 8000, temperature = 0.7, model = MODEL_MAIN, models = null } = {}) {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) throw new Error('GEMINI_API_KEY is not set on the server.');
+  const apiKey = pickApiKey();
 
   const body = JSON.stringify({
     contents: [{ role: 'user', parts }],
@@ -95,38 +164,46 @@ async function callGemini(parts, { maxTokens = 8000, temperature = 0.7, model = 
 
   const MAX_ATTEMPTS = 3;
   let lastError;
-  for (const currentModel of cascade) {
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-      const res = await fetch(`${GEMINI_BASE}/${currentModel}:generateContent?key=${apiKey}`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body
-      });
 
-      if ((res.status === 503 || res.status === 429) && attempt < MAX_ATTEMPTS) {
-        await new Promise(r => setTimeout(r, attempt * 2000));
-        continue;
+  await geminiSem.acquire();
+  try {
+    for (const currentModel of cascade) {
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        const res = await fetch(`${GEMINI_BASE}/${currentModel}:generateContent?key=${apiKey}`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body
+        });
+
+        if ((res.status === 503 || res.status === 429) && attempt < MAX_ATTEMPTS) {
+          await res.text(); // drain body so the connection is released back to the pool
+          await new Promise(r => setTimeout(r, attempt * 2000));
+          continue;
+        }
+
+        if (res.status === 503 || res.status === 429) {
+          await res.text(); // drain body so the connection is released back to the pool
+          lastError = new Error(`Gemini API ${res.status} on ${currentModel}`);
+          break;
+        }
+
+        // 400 usually means this model doesn't support the request (e.g. no vision) — fall through
+        if (res.status === 400) {
+          const text = await res.text();
+          lastError = new Error(`Gemini API 400 on ${currentModel}`);
+          console.warn(`[callGemini] ${currentModel} returned 400, trying next model`);
+          break;
+        }
+
+        if (!res.ok) {
+          const text = await res.text();
+          throw new Error(`Gemini API ${res.status}: ${text}`);
+        }
+
+        const data = await res.json();
+        return data.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
       }
-
-      if (res.status === 503 || res.status === 429) {
-        lastError = new Error(`Gemini API ${res.status} on ${currentModel}`);
-        break;
-      }
-
-      // 400 usually means this model doesn't support the request (e.g. no vision) — fall through
-      if (res.status === 400) {
-        const text = await res.text();
-        lastError = new Error(`Gemini API 400 on ${currentModel}`);
-        console.warn(`[callGemini] ${currentModel} returned 400, trying next model`);
-        break;
-      }
-
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(`Gemini API ${res.status}: ${text}`);
-      }
-
-      const data = await res.json();
-      return data.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
     }
+  } finally {
+    geminiSem.release();
   }
 
   throw lastError ?? new Error('All Gemini models unavailable');
@@ -377,6 +454,245 @@ app.get('/health', (_req, res) => {
   res.json({ ok: true });
 });
 
+// ---------- User Profile ----------
+
+async function getAuthUser(req, res) {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : req.body?.access_token;
+  if (!token) { res.status(401).json({ error: 'Missing auth token.' }); return null; }
+  const { data: { user }, error } = await supabase.auth.getUser(token);
+  if (error || !user) { res.status(401).json({ error: 'Unauthorized.' }); return null; }
+  return user;
+}
+
+function extractDisplayName(supabaseUser, fallback) {
+  const meta = supabaseUser?.user_metadata ?? {};
+  return meta.display_name || meta.full_name || meta.name || fallback || supabaseUser?.email?.split('@')[0] || 'FreshPlate User';
+}
+
+// POST /users/sync-profile — store display name for friend lookup
+app.post('/users/sync-profile', requireSupabase, async (req, res) => {
+  try {
+    const user = await getAuthUser(req, res);
+    if (!user) return;
+    const { display_name } = req.body ?? {};
+    if (!display_name) return res.status(400).json({ error: 'display_name required.' });
+
+    await supabase.from('user_profiles').upsert(
+      { id: user.id, email: user.email, display_name },
+      { onConflict: 'id' }
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[users/sync-profile]', err);
+    res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+// ---------- Friends ----------
+
+// POST /friends/lookup — check if an email has a FreshPlate account
+app.post('/friends/lookup', requireSupabase, async (req, res) => {
+  try {
+    const user = await getAuthUser(req, res);
+    if (!user) return;
+
+    const { email } = req.body ?? {};
+    if (!email) return res.status(400).json({ error: 'Email required.' });
+    const normalised = email.toLowerCase().trim();
+
+    if (normalised === user.email?.toLowerCase()) {
+      return res.status(400).json({ error: "That's your own account — try a friend's email!" });
+    }
+
+    // Look up in user_profiles table first (populated via sync-profile on login)
+    const { data: profile } = await supabase
+      .from('user_profiles')
+      .select('id, email, display_name')
+      .eq('email', normalised)
+      .maybeSingle();
+
+    if (!profile) {
+      return res.status(404).json({ error: 'No FreshPlate account found with that email.' });
+    }
+
+    // Check for existing relationship
+    const { data: existing } = await supabase
+      .from('friend_requests')
+      .select('status')
+      .or(`and(sender_id.eq.${user.id},receiver_id.eq.${profile.id}),and(sender_id.eq.${profile.id},receiver_id.eq.${user.id})`)
+      .maybeSingle();
+
+    return res.json({
+      userId: profile.id,
+      email: profile.email,
+      name: profile.display_name || normalised.split('@')[0],
+      existingStatus: existing?.status || null
+    });
+  } catch (err) {
+    console.error('[friends/lookup]', err);
+    res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+// POST /friends/request — send a friend request
+app.post('/friends/request', requireSupabase, async (req, res) => {
+  try {
+    const user = await getAuthUser(req, res);
+    if (!user) return;
+
+    const { receiver_id, sender_name, receiver_name } = req.body ?? {};
+    if (!receiver_id) return res.status(400).json({ error: 'receiver_id required.' });
+    if (user.id === receiver_id) return res.status(400).json({ error: "You can't add yourself." });
+
+    // Block if already accepted
+    const { data: existing } = await supabase
+      .from('friend_requests')
+      .select('status')
+      .or(`and(sender_id.eq.${user.id},receiver_id.eq.${receiver_id}),and(sender_id.eq.${receiver_id},receiver_id.eq.${user.id})`)
+      .maybeSingle();
+
+    if (existing?.status === 'accepted') {
+      return res.status(400).json({ error: 'Already friends.' });
+    }
+
+    const { error } = await supabase.from('friend_requests').upsert({
+      sender_id: user.id,
+      receiver_id,
+      sender_name: sender_name || extractDisplayName(user, ''),
+      receiver_name: receiver_name || '',
+      status: 'pending'
+    }, { onConflict: 'sender_id,receiver_id' });
+
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[friends/request]', err);
+    res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+// GET /friends/incoming — pending requests addressed to me
+app.get('/friends/incoming', requireSupabase, async (req, res) => {
+  try {
+    const user = await getAuthUser(req, res);
+    if (!user) return;
+
+    const { data, error } = await supabase
+      .from('friend_requests')
+      .select('*')
+      .eq('receiver_id', user.id)
+      .eq('status', 'pending')
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    const requests = await Promise.all((data || []).map(async row => {
+      let senderName = row.sender_name || '';
+      let senderEmail = '';
+      try {
+        const { data: profile } = await supabase
+          .from('user_profiles')
+          .select('email, display_name')
+          .eq('id', row.sender_id)
+          .maybeSingle();
+        if (profile) { senderName = profile.display_name || senderName; senderEmail = profile.email; }
+      } catch {}
+      return { id: row.id, senderUserId: row.sender_id, senderName, senderEmail, createdAt: row.created_at };
+    }));
+
+    res.json({ requests });
+  } catch (err) {
+    console.error('[friends/incoming]', err);
+    res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+// GET /friends/outgoing — my pending outgoing requests
+app.get('/friends/outgoing', requireSupabase, async (req, res) => {
+  try {
+    const user = await getAuthUser(req, res);
+    if (!user) return;
+
+    const { data, error } = await supabase
+      .from('friend_requests')
+      .select('*')
+      .eq('sender_id', user.id)
+      .eq('status', 'pending')
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    const requests = await Promise.all((data || []).map(async row => {
+      let receiverName = row.receiver_name || '';
+      let receiverEmail = '';
+      try {
+        const { data: profile } = await supabase
+          .from('user_profiles')
+          .select('email, display_name')
+          .eq('id', row.receiver_id)
+          .maybeSingle();
+        if (profile) { receiverName = profile.display_name || receiverName; receiverEmail = profile.email; }
+      } catch {}
+      return { id: row.id, receiverUserId: row.receiver_id, receiverName, receiverEmail, createdAt: row.created_at };
+    }));
+
+    res.json({ requests });
+  } catch (err) {
+    console.error('[friends/outgoing]', err);
+    res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+// POST /friends/accept — accept an incoming request
+app.post('/friends/accept', requireSupabase, async (req, res) => {
+  try {
+    const user = await getAuthUser(req, res);
+    if (!user) return;
+
+    const { request_id } = req.body ?? {};
+    if (!request_id) return res.status(400).json({ error: 'request_id required.' });
+
+    const myName = extractDisplayName(user, '');
+    const { data, error } = await supabase
+      .from('friend_requests')
+      .update({ status: 'accepted', receiver_name: myName })
+      .eq('id', request_id)
+      .eq('receiver_id', user.id)
+      .select()
+      .single();
+
+    if (error || !data) return res.status(404).json({ error: 'Request not found.' });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[friends/accept]', err);
+    res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+// POST /friends/decline — decline or cancel a request
+app.post('/friends/decline', requireSupabase, async (req, res) => {
+  try {
+    const user = await getAuthUser(req, res);
+    if (!user) return;
+
+    const { request_id } = req.body ?? {};
+    if (!request_id) return res.status(400).json({ error: 'request_id required.' });
+
+    const { error } = await supabase
+      .from('friend_requests')
+      .delete()
+      .eq('id', request_id)
+      .or(`receiver_id.eq.${user.id},sender_id.eq.${user.id}`);
+
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[friends/decline]', err);
+    res.status(500).json({ error: 'Server error.' });
+  }
+});
+
 // ---------- Scan Food ----------
 
 app.post('/api/ai/scan-food', ...aiLimiter, async (req, res) => {
@@ -486,6 +802,15 @@ app.post('/api/ai/search-recipes', ...aiLimiter, recipeDailyLimiter, async (req,
     });
   }
 
+  // Stage 1b — in-memory cache hit (skip Gemini entirely if we've seen this query recently)
+  // Cache key ignores pantry items so the base recipes are shared across users.
+  const cacheKey = safeQuery.toLowerCase().trim();
+  const cached = getCachedRecipes(cacheKey);
+  if (cached) {
+    console.log('[search-recipes] cache hit:', safeQuery);
+    return res.json(cached);
+  }
+
   // Stage 2 — simple YES/NO food check (cheap: ~5 tokens out)
   try {
     const checkText = await callGemini(
@@ -559,6 +884,7 @@ app.post('/api/ai/search-recipes', ...aiLimiter, recipeDailyLimiter, async (req,
       parsed[0].name = titleCase;
     }
 
+    setCachedRecipes(cacheKey, parsed);
     res.json(parsed);
   } catch (err) {
     console.error('[search-recipes]', err.message);
@@ -1013,7 +1339,10 @@ app.use((err, _req, res, _next) => {
 
 app.listen(PORT, () => {
   console.log(`FreshPlate backend running on port ${PORT}`);
-  if (!process.env.GEMINI_API_KEY) {
-    console.warn('WARNING: GEMINI_API_KEY is not set — AI endpoints will fail.');
+  if (GEMINI_KEYS.length === 0) {
+    console.warn('WARNING: No GEMINI_API_KEY(S) configured — AI endpoints will fail.');
+  } else {
+    const concLimit = Number(process.env.GEMINI_MAX_CONCURRENT) || 20;
+    console.log(`Gemini: ${GEMINI_KEYS.length} key(s) loaded, concurrency limit ${concLimit}`);
   }
 });
