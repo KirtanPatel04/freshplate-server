@@ -133,6 +133,9 @@ class Semaphore {
   release() { this.#active--; if (this.#queue.length) this.#queue.shift()(); }
 }
 const geminiSem = new Semaphore(Number(process.env.GEMINI_MAX_CONCURRENT) || 20);
+// Meal plan generation is heavy (4k–6k tokens, possible retry = 2 Gemini calls).
+// Serialise to 1 at a time so two users never race each other into 429s.
+const mealPlanSem = new Semaphore(1);
 
 // ── Recipe search cache ────────────────────────────────────────────────────────
 // If two users search for the same dish, only one Gemini call is made.
@@ -966,6 +969,7 @@ app.post('/api/ai/generate-meal-plan', ...aiLimiter, mealPlanDailyLimiter, async
     '{"mealType":"Breakfast","name":"str","calories":0,"protein":0.0,"carbs":0.0,"fat":0.0,"fiber":0.0,"servingSize":"str","emoji":"str"}]}]}\n' +
     'mealType: Breakfast, Lunch, Dinner, or Snack. Include all 4 per day. Realistic macros. Vary across days.';
 
+  await mealPlanSem.acquire();
   try {
     const planTokens = Math.min(Math.max(Math.ceil(safeDays * 700), 4000), 6000);
 
@@ -990,6 +994,8 @@ app.post('/api/ai/generate-meal-plan', ...aiLimiter, mealPlanDailyLimiter, async
       ? 'The AI is currently busy with multiple requests. Please try again in 30 seconds.'
       : err.message;
     res.status(500).json({ error: friendly });
+  } finally {
+    mealPlanSem.release();
   }
 });
 
