@@ -96,11 +96,12 @@ const aiLimiter = [perMinuteLimiter, dailyLimiter];
 // ---------- Gemini helpers ----------
 
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
-// Waterfall: try each model in order; move to next on quota/overload errors.
+// Waterfall: try each model in order; move to next on 429/503 errors.
+// 3.5-flash-lite has a free tier — exhausted quota returns 429, which auto-falls to 2.5-flash-lite.
 const MODEL_WATERFALL = [
-  'gemini-2.5-flash-lite',  // primary — cheapest, fastest
-  'gemini-2.5-flash',       // fallback — same generation, higher output limits
-  'gemini-3.1-flash-lite',  // last resort — newer generation, higher quality
+  'gemini-3.5-flash-lite',  // primary — free tier first, newest quality
+  'gemini-2.5-flash-lite',  // fallback — cheapest paid option when free tier exhausted
+  'gemini-2.5-flash',       // last resort — higher output limits
 ];
 const MODEL_MAIN  = MODEL_WATERFALL[0];
 const MODEL_CHECK = MODEL_WATERFALL[0];
