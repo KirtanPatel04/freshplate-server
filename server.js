@@ -838,7 +838,8 @@ app.post('/api/ai/search-recipes', ...aiLimiter, recipeDailyLimiter, async (req,
     `The user searched for: "${safeQuery}". Return exactly 4 recipes as a JSON array.\n\n` +
     `ARRAY INDEX 0 — THE EXACT RECIPE THE USER SEARCHED FOR:\n` +
     `  • "name" MUST be "${safeQuery}" with proper capitalisation of each word\n` +
-    `  • Give the classic, definitive version of this exact dish\n` +
+    `  • Give the classic, definitive version of this exact dish — the same recipe a top cooking channel would make\n` +
+    `  • Use the authentic, traditional ingredients that any well-known food creator would list for this dish\n` +
     `  • DO NOT rename it, reinterpret it, or replace it with a similar dish\n` +
     `  • If the user typed "Butter Chicken", index 0 name is "Butter Chicken" — not "Chicken Curry"\n` +
     `  • If the user typed "pasta", index 0 name is "Pasta" — not "Spaghetti Bolognese"\n\n` +
@@ -856,7 +857,7 @@ app.post('/api/ai/search-recipes', ...aiLimiter, recipeDailyLimiter, async (req,
   recipePrompt +=
     `Return ONLY a JSON array (no markdown, no extra text):\n` +
     `[{"name":"str","emoji":"str","prepTime":"20 min","difficulty":"Easy|Medium|Hard","calories":0,"protein":0.0,"carbs":0.0,"fat":0.0,"ingredients":["str"],"steps":["str"]}]\n` +
-    `Include 4-7 ingredients with amounts and 4-6 clear cooking steps. Accurate macros per serving.`;
+    `Use 6-10 authentic, precisely measured ingredients (e.g. "2 tbsp olive oil", "1 tsp cumin", "200g chicken breast") — the exact ones a top cooking channel would list for this dish. Include 4-6 clear cooking steps. Accurate macros per serving.`;
 
   try {
     let text = await callGemini([{ text: recipePrompt }], { maxTokens: 5000 });
@@ -908,7 +909,7 @@ app.post('/api/ai/generate-single-recipe', ...aiLimiter, async (req, res) => {
     `Generate a recipe for: ${safeName}.\n` +
     'Return ONLY compact JSON (no markdown): ' +
     '{"emoji":"str","calories":0,"protein":0.0,"carbs":0.0,"fat":0.0,"ingredients":["str"],"steps":["str"]}\n' +
-    'Include 5-8 ingredients with quantities and 4-6 clear cooking steps. Accurate nutrition per serving.';
+    'Use 6-10 authentic, precisely measured ingredients (e.g. "2 tbsp olive oil", "1 tsp cumin", "200g chicken breast") — the exact ones a top cooking channel would list for the classic version of this dish. Include 4-6 clear cooking steps. Accurate nutrition per serving.';
 
   try {
     const text = await callGemini([{ text: prompt }], { maxTokens: 800 });
