@@ -286,6 +286,12 @@ app.post('/auth/signup', requireSupabase, async (req, res) => {
     });
     if (signInErr) return res.status(400).json({ error: signInErr.message });
 
+    // Index user so friend search works immediately
+    await supabase.from('user_profiles').upsert(
+      { id: session.user.id, email: session.user.email, display_name: session.user.email.split('@')[0] },
+      { onConflict: 'id', ignoreDuplicates: true }
+    );
+
     res.json({
       access_token:  session.session.access_token,
       refresh_token: session.session.refresh_token,
@@ -308,6 +314,12 @@ app.post('/auth/signin', requireSupabase, async (req, res) => {
       email: email.toLowerCase().trim(), password
     });
     if (error) return res.status(401).json({ error: 'Invalid email or password.' });
+
+    // Index user so friend search works immediately
+    await supabase.from('user_profiles').upsert(
+      { id: data.user.id, email: data.user.email, display_name: data.user.email.split('@')[0] },
+      { onConflict: 'id', ignoreDuplicates: true }
+    );
 
     res.json({
       access_token:  data.session.access_token,
@@ -334,12 +346,20 @@ app.post('/auth/google', requireSupabase, async (req, res) => {
     if (error) return res.status(400).json({ error: error.message });
 
     const meta = data.user.user_metadata ?? {};
+    const displayName = meta.full_name ?? meta.name ?? '';
+
+    // Index user so friend search works immediately
+    await supabase.from('user_profiles').upsert(
+      { id: data.user.id, email: data.user.email, display_name: displayName || data.user.email?.split('@')[0] },
+      { onConflict: 'id', ignoreDuplicates: true }
+    );
+
     res.json({
       access_token:  data.session.access_token,
       refresh_token: data.session.refresh_token,
       user_id:       data.user.id,
       email:         data.user.email ?? '',
-      name:          meta.full_name ?? meta.name ?? ''
+      name:          displayName
     });
   } catch (err) {
     console.error('[auth/google]', err);
@@ -360,12 +380,20 @@ app.post('/auth/apple', requireSupabase, async (req, res) => {
     if (error) return res.status(400).json({ error: error.message });
 
     const meta = data.user.user_metadata ?? {};
+    const displayName = meta.full_name ?? meta.name ?? '';
+
+    // Index user so friend search works immediately
+    await supabase.from('user_profiles').upsert(
+      { id: data.user.id, email: data.user.email, display_name: displayName || data.user.email?.split('@')[0] },
+      { onConflict: 'id', ignoreDuplicates: true }
+    );
+
     res.json({
       access_token:  data.session.access_token,
       refresh_token: data.session.refresh_token,
       user_id:       data.user.id,
       email:         data.user.email ?? '',
-      name:          meta.full_name ?? meta.name ?? ''
+      name:          displayName
     });
   } catch (err) {
     console.error('[auth/apple]', err);
@@ -509,15 +537,27 @@ app.post('/friends/lookup', requireSupabase, async (req, res) => {
       return res.status(400).json({ error: "That's your own account — try a friend's email!" });
     }
 
-    // Look up in user_profiles table first (populated via sync-profile on login)
-    const { data: profile } = await supabase
+    // Look up in user_profiles table first (populated on every sign-in)
+    let { data: profile } = await supabase
       .from('user_profiles')
       .select('id, email, display_name')
       .eq('email', normalised)
       .maybeSingle();
 
     if (!profile) {
-      return res.status(404).json({ error: 'No FreshPlate account found with that email.' });
+      // Fallback: search Supabase auth users directly for accounts that predate the indexing fix
+      const { data: adminData, error: adminErr } = await supabase.auth.admin.listUsers({ filter: normalised });
+      const authUser = !adminErr && adminData?.users?.find(u => u.email?.toLowerCase() === normalised);
+      if (!authUser) {
+        return res.status(404).json({ error: 'No FreshPlate account found with that email.' });
+      }
+      // Backfill so future lookups hit the fast path
+      const displayName = authUser.user_metadata?.display_name || authUser.user_metadata?.full_name || authUser.user_metadata?.name || normalised.split('@')[0];
+      await supabase.from('user_profiles').upsert(
+        { id: authUser.id, email: authUser.email, display_name: displayName },
+        { onConflict: 'id' }
+      );
+      profile = { id: authUser.id, email: authUser.email, display_name: displayName };
     }
 
     // Check for existing relationship
