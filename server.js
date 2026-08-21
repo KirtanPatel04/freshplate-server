@@ -737,6 +737,76 @@ app.post('/friends/decline', requireSupabase, async (req, res) => {
   }
 });
 
+// ---------- Open Food Facts lookup ----------
+// Used when Gemini identifies a branded/packaged product — returns actual label nutrition
+// instead of an AI estimate. No API key required; we follow OFF's bot policy by sending
+// a User-Agent. Timeout is short (6 s) so a slow response falls back to the AI estimate.
+
+async function lookupOpenFoodFacts(productQuery) {
+  const encoded = encodeURIComponent(productQuery.slice(0, 120));
+  const url =
+    `https://world.openfoodfacts.org/cgi/search.pl` +
+    `?search_terms=${encoded}&search_simple=1&json=1&page_size=5` +
+    `&fields=product_name,brands,nutriments,serving_size,serving_quantity`;
+
+  const res = await fetch(url, {
+    headers: { 'User-Agent': 'FreshPlate/1.0 (nutrition tracker; kirtanp0409@gmail.com)' },
+    signal: AbortSignal.timeout(6000)
+  });
+  if (!res.ok) return null;
+
+  const data = await res.json();
+  const products = data.products ?? [];
+  if (!products.length) return null;
+
+  // Prefer an entry that has serving_quantity AND all core nutrients
+  const hasServing = products.find(p =>
+    parseFloat(p.serving_quantity) > 0 &&
+    p.nutriments?.['energy-kcal_100g'] != null &&
+    p.nutriments?.['proteins_100g'] != null &&
+    p.nutriments?.['carbohydrates_100g'] != null &&
+    p.nutriments?.['fat_100g'] != null
+  );
+  const product = hasServing ?? products[0];
+  if (!product) return null;
+
+  const n = product.nutriments || {};
+
+  // Prefer kcal field; fall back to kJ ÷ 4.184
+  const cal100 = n['energy-kcal_100g']
+    ?? (n['energy_100g'] != null ? n['energy_100g'] / 4.184 : null);
+
+  const pro100  = n['proteins_100g'];
+  const carb100 = n['carbohydrates_100g'];
+  const fat100  = n['fat_100g'];
+
+  // Reject if any core macro is missing — data is too incomplete to trust
+  if (cal100 == null || pro100 == null || carb100 == null || fat100 == null) return null;
+
+  // Serving size: prefer the product's declared serving quantity (grams), else 100 g
+  const servingGrams = parseFloat(product.serving_quantity) || 100;
+  const factor = servingGrams / 100;
+
+  const fiber100 = n['fiber_100g'] ?? 0;
+  const servingSizeLabel = product.serving_size || `${servingGrams}g`;
+
+  const brand = product.brands ? product.brands.split(',')[0].trim() : '';
+  const productName = product.product_name || productQuery;
+  const displayName = brand && !productName.toLowerCase().includes(brand.toLowerCase())
+    ? `${productName} (${brand})`
+    : productName;
+
+  return {
+    name:        displayName,
+    calories:    Math.round(cal100  * factor),
+    protein:     Math.round(pro100  * factor * 10) / 10,
+    carbs:       Math.round(carb100 * factor * 10) / 10,
+    fat:         Math.round(fat100  * factor * 10) / 10,
+    fiber:       Math.round(fiber100 * factor * 10) / 10,
+    servingSize: servingSizeLabel,
+  };
+}
+
 // ---------- Scan Food ----------
 
 app.post('/api/ai/scan-food', ...aiLimiter, async (req, res) => {
@@ -745,18 +815,56 @@ app.post('/api/ai/scan-food', ...aiLimiter, async (req, res) => {
   if (!image) return res.status(400).json({ error: 'image is required' });
 
   try {
+    // Ask Gemini to identify the food AND flag if it's a branded/packaged product.
+    // For branded products we prefer the real label data over an AI estimate.
     const text = await callGemini(
       [
         { inlineData: { mimeType, data: image } },
         {
-          text: 'Identify the food in this image and estimate nutritional info for a typical single serving. ' +
-                'Return ONLY compact JSON with no extra text or markdown: ' +
-                '{"name":"str","emoji":"str","calories":0,"protein":0.0,"carbs":0.0,"fat":0.0,"fiber":0.0,"servingSize":"str"}'
+          text:
+            'Analyze this food image.\n\n' +
+            'STEP 1 — Is this a branded or packaged product where you can clearly read (or strongly infer) the brand/product name on the label? ' +
+            'Examples of branded: Nutella, Oreos, Lay\'s chips, Coca-Cola, Yoplait yogurt, Kraft singles. ' +
+            'Examples of NOT branded: a plate of pasta, a smoothie bowl, a home-cooked curry, fresh fruit.\n\n' +
+            'If it IS branded: set isBranded=true and set productQuery to the best search string for this product ' +
+            '(e.g. "Nutella hazelnut chocolate spread Ferrero"). ' +
+            'If it is NOT branded: set isBranded=false and productQuery="".\n\n' +
+            'STEP 2 — Provide your best nutritional estimate for a typical single serving regardless of branding ' +
+            '(this is used as fallback if the database lookup fails).\n\n' +
+            'Return ONLY compact JSON with no extra text or markdown:\n' +
+            '{"name":"str","emoji":"str","isBranded":false,"productQuery":"str","calories":0,"protein":0.0,"carbs":0.0,"fat":0.0,"fiber":0.0,"servingSize":"str"}'
         }
       ],
-      { maxTokens: 300, temperature: 0.2 }
+      { maxTokens: 400, temperature: 0.2 }
     );
-    res.json(JSON.parse(extractJSON(text)));
+
+    const gemini = JSON.parse(extractJSON(text));
+
+    // If Gemini flagged this as branded, try Open Food Facts for the real label data
+    if (gemini.isBranded && gemini.productQuery) {
+      try {
+        const db = await lookupOpenFoodFacts(gemini.productQuery);
+        if (db) {
+          console.log('[scan-food] branded lookup success:', db.name);
+          return res.json({
+            name:        db.name,
+            emoji:       gemini.emoji || '🛒',
+            calories:    db.calories,
+            protein:     db.protein,
+            carbs:       db.carbs,
+            fat:         db.fat,
+            fiber:       db.fiber,
+            servingSize: db.servingSize,
+          });
+        }
+      } catch (dbErr) {
+        console.warn('[scan-food] OFF lookup failed, using AI estimate:', dbErr.message);
+      }
+    }
+
+    // Fresh/homemade food or branded lookup failed — return Gemini's visual estimate
+    const { isBranded, productQuery, ...result } = gemini;
+    res.json(result);
   } catch (err) {
     console.error('[scan-food]', err.message);
     res.status(500).json({ error: err.message });
@@ -771,18 +879,50 @@ app.post('/api/ai/analyze-meal', ...aiLimiter, async (req, res) => {
   if (!image) return res.status(400).json({ error: 'image is required' });
 
   try {
+    // Same branded-product detection as scan-food, but also asks for ingredient breakdown.
     const text = await callGemini(
       [
         { inlineData: { mimeType, data: image } },
         {
-          text: 'Analyze this meal photo in detail. Identify every ingredient visible and estimate the full nutritional breakdown for the entire plate. ' +
-                'Return ONLY compact JSON: ' +
-                '{"name":"str","emoji":"str","calories":0,"protein":0.0,"carbs":0.0,"fat":0.0,"fiber":0.0,"servingSize":"str","ingredients":["ingredient with qty"]}'
+          text:
+            'Analyze this food/meal photo.\n\n' +
+            'STEP 1 — Is this a single branded or packaged product with a clearly readable label? ' +
+            'Set isBranded=true and productQuery to the best OFF search string only if the ENTIRE photo is one branded item. ' +
+            'If it\'s a meal, dish, or mix of ingredients, set isBranded=false.\n\n' +
+            'STEP 2 — Identify every ingredient visible and estimate the full nutritional breakdown for the entire portion shown.\n\n' +
+            'Return ONLY compact JSON:\n' +
+            '{"name":"str","emoji":"str","isBranded":false,"productQuery":"str","calories":0,"protein":0.0,"carbs":0.0,"fat":0.0,"fiber":0.0,"servingSize":"str","ingredients":["ingredient with qty"]}'
         }
       ],
-      { maxTokens: 500, temperature: 0.2 }
+      { maxTokens: 600, temperature: 0.2 }
     );
-    res.json(JSON.parse(extractJSON(text)));
+
+    const gemini = JSON.parse(extractJSON(text));
+
+    if (gemini.isBranded && gemini.productQuery) {
+      try {
+        const db = await lookupOpenFoodFacts(gemini.productQuery);
+        if (db) {
+          console.log('[analyze-meal] branded lookup success:', db.name);
+          return res.json({
+            name:        db.name,
+            emoji:       gemini.emoji || '🛒',
+            calories:    db.calories,
+            protein:     db.protein,
+            carbs:       db.carbs,
+            fat:         db.fat,
+            fiber:       db.fiber,
+            servingSize: db.servingSize,
+            ingredients: gemini.ingredients || [],
+          });
+        }
+      } catch (dbErr) {
+        console.warn('[analyze-meal] OFF lookup failed, using AI estimate:', dbErr.message);
+      }
+    }
+
+    const { isBranded, productQuery, ...result } = gemini;
+    res.json(result);
   } catch (err) {
     console.error('[analyze-meal]', err.message);
     res.status(500).json({ error: err.message });
